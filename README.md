@@ -155,10 +155,15 @@ no marks in between:
 
 The line then holds fewer cells than it holds bytes, which is the honest
 picture: those bytes are one letter. Bytes that are not valid UTF-8 show as `.`
-and decoding resyncs on the next byte rather than guessing. East Asian
-characters are two columns wide and would shift the grid, so they are refused
-the same way — the bytes are still there in the dump, the viewer just does not
-pretend to draw them.
+and decoding resyncs on the next byte rather than guessing.
+
+What the viewer will draw at all is a whitelist: Latin, Greek and Cyrillic
+letters, punctuation, and the symbols and box drawing its own code pages can
+produce. Everything else — CJK, Arabic, Hebrew, emoji, combining marks,
+invisibles — comes out as `.`, because a character the terminal draws in two
+columns, or in none, shifts everything after it and the row stops matching the
+width it was padded to. The bytes are still there in the dump; the viewer just
+does not pretend to draw them.
 
 UTF-16 takes its alignment from the file offset, not from wherever a line
 happened to start reading: the same four bytes one byte further along pair up
@@ -321,6 +326,15 @@ A UTF-8 character can straddle a line break, so each line is decoded with a few
 bytes of context on either side. Without the lead-in the first letter of every
 line would decode as garbage; without the lookahead the last one would.
 
+The list of characters worth drawing is a whitelist, and started life as a
+blacklist of the wide and zero-width blocks — which is the natural way round to
+think about it and quietly wrong. Nine and a half thousand code points in the
+BMP alone are not one column wide, and no hand-written list of blocks is going
+to catch them. It showed up as the background stopping short of the right edge,
+by a different amount on every row, when reading arbitrary bytes as UTF-16: one
+bidi control or combining mark per row was enough, since the viewer counted
+characters where the terminal counts columns.
+
 The limit on how far the view scrolls is measured from the row the last byte
 sits on, not from the file length. They are the same number only when the
 length is a whole multiple of the line width; the rest of the time, measuring
@@ -368,7 +382,7 @@ from the previous frame show through.
 cargo test
 ```
 
-86 tests.
+88 tests.
 
 *The reader:* window buffer moves across boundaries, reads past the end of the
 file, a match landing exactly on a block seam searched forwards and backwards,
@@ -379,7 +393,10 @@ a file appended to, truncated, and replaced by rename underneath a live window.
 text encoded through each code page.
 
 *Encodings:* one cell per byte for all 256 values of every code page at both
-offset parities, every Cyrillic page decoding its own bytes, the Western pages
+offset parities, no encoding able to produce a cell that is not one column wide
+— swept over every UTF-16 code unit in both byte orders, every scalar value in
+the BMP as UTF-8, and every byte of every single-byte page — every glyph those
+same code pages can produce being one the viewer will draw, every Cyrillic page decoding its own bytes, the Western pages
 differing where they should, UTF-8 resyncing after invalid bytes, UTF-16 byte
 orders and surrogate pairs, wide characters refused, and a query round-tripping
 through each page.

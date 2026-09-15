@@ -283,35 +283,44 @@ fn one_cell_or_dot(c: char) -> char {
 
 /// Can this character be drawn in exactly one terminal cell?
 ///
-/// No `unicode-width` dependency: the viewer only needs to protect the column
-/// grid, and the ranges below are what actually breaks it — controls,
-/// combining marks, zero-width characters and the East Asian double-width
-/// blocks. Whatever is rejected falls back to a dot, which is honest: the byte
-/// is there, we just do not pretend to draw it.
+/// A whitelist, and deliberately a narrow one. It was a blacklist of the wide
+/// and zero-width blocks first, which is the natural way round to think about
+/// it and quietly wrong: nine and a half thousand code points in the BMP alone
+/// are not one column wide, and the list of blocks they live in is nothing
+/// anyone will get right by hand. Reading arbitrary bytes as UTF-16 turns up
+/// such a character every few rows — a combining mark, a bidi control, an
+/// emoji — and one of them is enough to make a row that the terminal draws
+/// narrower than the viewer padded it, so the background stops short of the
+/// edge and the columns stop lining up.
+///
+/// So: the ranges below are letters, punctuation and symbols that are one
+/// column, left to right, and combine with nothing. Between them they cover
+/// every glyph our own code pages can produce (there is a test for that) plus
+/// Latin, Greek and Cyrillic text in any Unicode encoding. Everything else —
+/// CJK, Arabic, Hebrew, emoji, marks, invisibles — is drawn as `.`, which for
+/// a byte viewer is the honest answer: the bytes are there in the dump, and
+/// the grid they sit in survives.
 fn one_cell(c: char) -> bool {
-    if c.is_control() || c == '\0' {
-        return false;
-    }
-    let u = c as u32;
-    if u == 0x00AD || u == 0x200B || u == 0xFEFF {
-        return false; // soft hyphen, zero-width space, BOM
-    }
-    !matches!(u,
-        0x0300..=0x036F        // combining marks
-        | 0x1100..=0x115F      // Hangul Jamo
-        | 0x2E80..=0x303E      // CJK radicals, Kangxi, CJK punctuation
-        | 0x3041..=0x33FF      // kana, CJK compatibility
-        | 0x3400..=0x4DBF
-        | 0x4E00..=0x9FFF      // CJK unified ideographs
-        | 0xA000..=0xA4CF      // Yi
-        | 0xAC00..=0xD7A3      // Hangul syllables
-        | 0xF900..=0xFAFF      // CJK compatibility ideographs
-        | 0xFE10..=0xFE19
-        | 0xFE30..=0xFE6F
-        | 0xFF00..=0xFF60      // fullwidth forms
-        | 0xFFE0..=0xFFE6
-        | 0x1F300..=0x1FAFF    // emoji
-        | 0x20000..=0x3FFFD    // CJK extensions
+    matches!(c as u32,
+        0x0020..=0x007E                     // ASCII printable
+        | 0x00A0..=0x00AC | 0x00AE..=0x00FF // Latin-1, less the soft hyphen
+        | 0x0100..=0x024F                   // Latin Extended-A and -B
+        | 0x02C6..=0x02DD                   // the spacing diacritics the Windows pages use
+        | 0x0370..=0x03FF                   // Greek
+        | 0x0400..=0x0482 | 0x048A..=0x052F // Cyrillic, less its combining marks
+        | 0x2010..=0x2027                   // dashes, quotes, bullet, ellipsis
+        | 0x2030..=0x205E                   // per mille, ‼, angle quotes, fractions
+        | 0x2070..=0x209C                   // superscripts and subscripts
+        | 0x20A0..=0x20BF                   // currency signs
+        | 0x2100..=0x218F                   // letterlike forms and numerals
+        | 0x2190..=0x22FF                   // arrows and mathematics
+        | 0x2300..=0x2319 | 0x231C..=0x2321 // ⌂ ⌐ ⌠ ⌡, around the watch and hourglass
+        | 0x2500..=0x259F                   // box drawing and blocks
+        | 0x25A0..=0x25F7                   // geometric shapes
+        | 0x263A..=0x263C                   // ☺ ☻ ☼
+        | 0x2640 | 0x2642                   // ♀ ♂
+        | 0x2660..=0x266F                   // card suits and notes
+        | 0xFB00..=0xFB06                   // ﬁ ﬂ and the rest of the ligatures
     )
 }
 
@@ -859,6 +868,81 @@ mod tests {
         // A CJK ideograph is three bytes but two columns wide, so the letter
         // itself is refused; the continuation cells still mark the sequence.
         assert_eq!(cells(Encoding::Utf8, "漢".as_bytes()), ".··");
+    }
+
+    /// A cell the terminal draws in one column: either a character we vouch
+    /// for, or one of the two stand-ins.
+    fn one_column(c: char) -> bool {
+        one_cell(c) || c == '.' || c == CONTINUATION
+    }
+
+    #[test]
+    fn every_glyph_our_own_code_pages_can_produce_is_drawable() {
+        for enc in Encoding::ALL {
+            let high = match high_table(enc) {
+                Some(t) => t,
+                None => continue,
+            };
+            for (i, &c) in high.iter().enumerate() {
+                // Undefined slots, the C1 controls ISO-8859-1 keeps in its
+                // upper half, the zero-width soft hyphen, and MacRoman's
+                // private-use Apple logo are all meant to come out as dots.
+                let stands_for_nothing = c == '\0'
+                    || c.is_control()
+                    || c == '\u{AD}'
+                    || ('\u{E000}'..='\u{F8FF}').contains(&c);
+                assert!(
+                    stands_for_nothing || one_cell(c),
+                    "{} byte {:#04X} is {:?}, which the viewer would refuse to draw",
+                    enc.name(),
+                    i + 0x80,
+                    c
+                );
+            }
+        }
+        // CP437's lower half is glyphs rather than control codes, and all of
+        // them have to make it to the screen — they are the DOS look.
+        for &c in &CP437[..0x80] {
+            assert!(one_cell(c), "CP437 {:?}", c);
+        }
+    }
+
+    #[test]
+    fn no_encoding_can_produce_a_cell_that_is_not_one_column() {
+        // The invariant the whole layout stands on, swept rather than argued.
+        // A cell the terminal draws in two columns, or in none, shifts
+        // everything after it: the row stops matching the width the viewer
+        // padded it to, and the background ends short of the edge.
+        let mut cells = Vec::new();
+
+        for enc in [Encoding::Utf16Le, Encoding::Utf16Be] {
+            for u in 0..=0xFFFFu32 {
+                let bytes = (u as u16).to_le_bytes();
+                decode(enc, 0, &bytes, &mut cells);
+                for &c in &cells {
+                    assert!(one_column(c), "{} unit {:#06X} -> {:?}", enc.name(), u, c);
+                }
+            }
+        }
+
+        let mut buf = [0u8; 4];
+        for u in 0..=0xFFFFu32 {
+            if let Some(ch) = char::from_u32(u) {
+                let s = ch.encode_utf8(&mut buf);
+                decode(Encoding::Utf8, 0, s.as_bytes(), &mut cells);
+                for &c in &cells {
+                    assert!(one_column(c), "UTF-8 {:?} -> {:?}", ch, c);
+                }
+            }
+        }
+
+        let all_bytes: Vec<u8> = (0..=255u8).collect();
+        for enc in Encoding::ALL {
+            decode(enc, 0, &all_bytes, &mut cells);
+            for &c in &cells {
+                assert!(one_column(c), "{} -> {:?}", enc.name(), c);
+            }
+        }
     }
 
     #[test]
