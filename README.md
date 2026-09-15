@@ -23,25 +23,31 @@ comes out around 500 KB.4
 |---|---|
 | `1` | binary mode — every byte as eight bits |
 | `2` | hex dump with a text column on the right |
-| `3` | text only, full screen |
-| `4` or `e` | next code page (`E` for the previous one) |
+| `3` | text mode; press it again to step to the next code page |
+| `e` `E` | next / previous code page, from any mode |
+| `[` `]` `\` | narrower / wider / window-wide data columns |
 | `←` `→` `↑` `↓` | move the cursor |
-| `Home` `End` | start / end of the line |
-| `Alt+←` `Alt+→` | start / end of the line |
-| `Ctrl+Home` `Ctrl+End` | start / end of the file |
+| `Home` `End` | start / end of the file |
+| `Cmd+←` `Cmd+→` | start / end of the line (`Ctrl` or `Alt` also work) |
 | `PgUp` `PgDn` | page up and down |
 | `Shift+←` `Shift+→` | slide the byte grid by one byte |
-| `g` or `F5` | go to offset |
+| `5` or `F5` | go to offset |
 | `6` or `F6` | line = record: break lines on a pattern |
+| `7` or `F7` | search |
+| `8` or `F8` | next match |
 | `9` or `F9` | wrap long records instead of cutting them |
-| `/` or `F7` | search |
-| `n` or `F8` | next match |
 | `h` | toggle match highlighting |
 | `r` | reread the file now |
 | `q`, `Esc` or `F10` | quit |
 
-Alt and Ctrl do the same thing on the arrows on purpose: terminals disagree
-about which of the two they deliver.
+`g`, `/` and `n` also work for goto, find and next.
+
+Cmd, Ctrl and Alt all do the same thing on the arrows because terminals cannot
+agree on which of them an application is allowed to see. Cmd is the one a Mac
+user reaches for and the hardest to actually get: Terminal.app and iTerm2 keep
+it for their own menus, and it only arrives in terminals that speak the kitty
+keyboard protocol and leave it alone — Ghostty, kitty, WezTerm. `Ctrl+←` and
+`Ctrl+→` work everywhere.
 
 ## The cursor
 
@@ -55,10 +61,14 @@ cursor would leave it, and then by one row. `PgUp` and `PgDn` move the view by
 as many rows as the cursor, so the cursor keeps its place on the screen instead
 of sliding to an edge.
 
-`Home` and `End` work on the line, the way they do in a DOS viewer; the whole
-file is one `Ctrl` away. In the record modes "the line" is the record, so `End`
-on a record that runs off the screen walks the cursor to its last byte and
-brings the tail into view with it.
+Every field of the readout is a fixed width, code page name included. One that
+changed length as the cursor moved would shove the rest of the bar back and
+forth while you were trying to read it.
+
+`Home` and `End` take the whole file. The ends of a line are on the modified
+arrows, and in the record modes "the line" is the record — so `Cmd+→` on a
+record that runs off the screen walks the cursor to its last byte and brings
+the tail into view with it.
 
 `Shift+←` and `Shift+→` are the one movement that is not the cursor's: they
 re-anchor the byte grid, so a structure that does not start on a line boundary
@@ -72,28 +82,51 @@ can be lined up. Every line moves together, by the same byte:
 
 ## Code pages
 
-`4` cycles through `ASCII → CP437 → CP866 → CP1251 → KOI8-R → UTF-8`, `E` goes
-back. The choice drives both the text column of the byte modes and the
-full-screen text mode, so a hex dump of a Russian file reads as Cyrillic
-instead of dots:
+`3` opens text mode, and every press after that steps to the next code page;
+`e` and `E` step forward and back from any mode. The choice drives both the
+text column of the byte modes and the full-screen text mode, so a hex dump of
+a Russian file reads as Cyrillic instead of dots:
 
 ```
 00000000: CF F0 E8 E2 E5 F2 2C 20 EC E8 F0 21 20 48 65 6C  Привет, мир! Hel
 ```
 
+Nineteen of them, in this order:
+
 | Code page | For |
 |---|---|
 | `ASCII` | the classic hex dump: printable as-is, everything else a dot |
 | `CP437` | the original IBM PC palette — ☺☻♥♦♣♠ and box drawing, all 256 bytes |
+| `CP850` | DOS Western Europe |
+| `CP852` | DOS Central Europe |
 | `CP866` | DOS Cyrillic |
+| `CP1250` | Windows Central Europe |
 | `CP1251` | Windows Cyrillic |
+| `CP1252` | Windows Western Europe |
+| `ISO-8859-1` | Latin-1 |
+| `ISO-8859-2` | Latin-2, Central Europe |
+| `ISO-8859-5` | ISO Cyrillic |
+| `ISO-8859-15` | Latin-9: Latin-1 with the euro sign |
 | `KOI8-R` | Cyrillic in older Unix files and mail |
+| `KOI8-U` | the Ukrainian variant |
+| `MacRoman` | classic Mac OS Western |
+| `MacCyrillic` | classic Mac OS Cyrillic |
 | `UTF-8` | decoded per character |
+| `UTF-16LE` | Windows text files, PE resources |
+| `UTF-16BE` | the other byte order |
+
+Worth knowing, because mislabelled text usually turns out to be one of these:
+`CP1252` and `ISO-8859-1` differ only in 0x80..0x9F, where Windows put the
+smart quotes and dashes that ISO left as control codes. A great deal of what
+claims to be Latin-1 is really CP1252, and `3` twice tells you which.
+
+The tables are generated from the reference mappings rather than typed, and
+adding another code page is one more generated table.
 
 The one thing the whole layout rests on is **one byte, one cell**: the text
 column has to line up with the byte column, and every cell has to map back to
-a file offset. Single-byte code pages give that for free. UTF-8 does not, so a
-multi-byte character is drawn on the cell of its leading byte and its
+a file offset. Single-byte code pages give that for free. The Unicode ones do
+not, so a multi-byte character is drawn on the cell of its leading byte and its
 continuation bytes get `·`:
 
 ```
@@ -107,6 +140,21 @@ columns wide and would shift the grid, so they are refused the same way — the
 bytes are still there in the dump, the viewer just does not pretend to draw
 them.
 
+UTF-16 takes its alignment from the file offset, not from wherever a line
+happened to start reading: the same four bytes one byte further along pair up
+differently and mean something else, and a line that began mid-character says
+so with a `·` in the first cell. A surrogate pair is one character over four
+bytes, and is read as one rather than as four dots.
+
+## The width of the data columns
+
+By default a line holds as many bytes as the window can fit. `[` and `]` make
+it fewer or more — 4 at a time in hex, 1 in binary — and `\` goes back to
+filling the window. Both columns show the same bytes, so this is the one dial
+there is: fewer bytes per line and the dump, text column and all, takes up less
+of the window. The mode's own limits are the stops: never below 4 bytes in hex
+or 1 in binary, never wider than the window can hold.
+
 ## Patterns
 
 A pattern is written the same way in search (`7`) and in record splitting
@@ -116,9 +164,12 @@ PNG signature). In the hex form `??` means any byte: `x:89 ?? 4E 47`.
 Text is encoded with the **current code page**, so searching for `Привет`
 while viewing a CP866 file looks for CP866 bytes, not UTF-8 ones — the same
 query hunts for different bytes depending on the view, which is what you
-want. Switch the code page and the pattern is re-encoded; if the text does not
-exist in the new one (`Привет` in CP437, say) the old bytes are kept and the
-status line says so.
+want. In a UTF-16 view the query becomes UTF-16 bytes, which is what it takes
+to find a string in a Windows binary at all.
+
+Switch the code page and the pattern is re-encoded; if the text does not exist
+in the new one (`Привет` in CP437, say) the old bytes are kept and the status
+line says so.
 
 Offsets for `5` are accepted in decimal (`1024`) or hex (`0x4D5A`, `$4D5A`).
 
@@ -136,18 +187,20 @@ becomes variable.
 00000029: 52 45 43 1A 41 42 43 44 45 46 47 48 49 4A 4B 4C 4D 4E 4F 50 ›REC.ABCDEFGHIJKLMNOP
 ```
 
-`↑`, `↓`, `PgUp`, `PgDn`, `Home` and `End` now move by records rather than by
-the grid — a step down is a search for the next occurrence, a step up a search
-backwards. That is what `find_backward` in `reader.rs` is for.
+`↑`, `↓`, `PgUp` and `PgDn` now move by records rather than by the grid — a
+step down is a search for the next occurrence, a step up a search backwards.
+That is what `find_backward` in `reader.rs` is for.
 
-Records longer than the window get one of two treatments, switched with `9`:
+Records longer than the window get one of two treatments, switched with `9`.
+The key is only on the bottom bar while a record pattern is set, since that is
+the only time it changes anything:
 
 **Cut** (the default) keeps one line per record. A red `›` where the separator
 goes means the record is only shown in part; walk the cursor right and the
 whole screen scrolls sideways with it, a red `‹` in the offset column marking
-what went off the left. `End` takes the cursor — and the view — to the end of
-the record in one step. `Shift+←` and `Shift+→` scroll sideways without moving
-the cursor.
+what went off the left. `Cmd+→` takes the cursor — and the view — to the end
+of the record in one step. `Shift+←` and `Shift+→` scroll sideways without
+moving the cursor.
 
 **Wrap** gives a long record as many lines as it needs, so all of it is on
 screen at once and nothing is ever cut:
@@ -207,7 +260,8 @@ the scrolling and the paging are written once and work in all of them.
 
 **`view.rs`** — formatting and how wide a line can be. All three modes are the
 same bytes formatted differently; only the number of cells per byte differs,
-and from it follows how many bytes fit on a line. The offset column widens from 8 to 12
+and from it follows how many bytes fit on a line, and how narrow the line
+width keys are allowed to make it. The offset column widens from 8 to 12
 digits by itself on files over 4 GiB.
 
 Drawing is virtualised: a frame reads exactly as many bytes as are visible
@@ -235,6 +289,12 @@ tempting and was wrong: `top` gets clamped, snapped and scrolled for all sorts
 of reasons, and each of those quietly threw the slide away — visibly so on a
 file small enough to fit on one screen, where `Shift+→` appeared to do nothing
 at all.
+
+The kitty keyboard protocol is asked for blind. crossterm can query whether
+the terminal supports it, but querying means writing a question and waiting up
+to two seconds for an answer that the terminals without it never send — and a
+viewer that opens a 50 GB file instantly has no business stalling two seconds
+on a keyboard question. Terminals that do not know the sequence swallow it.
 
 The event loop waits with a timeout instead of blocking on a key. That is what
 makes watching the file possible, and a frame is only redrawn when something
@@ -264,20 +324,29 @@ from the previous frame show through.
 cargo test
 ```
 
-61 tests. The reader: window buffer moves across boundaries, reads past the end
-of the file, a match landing exactly on a block seam searched forwards and
-backwards, a file appended to, truncated, and replaced by rename underneath a
-live window. Patterns: anchor choice with wildcards, a wildcard at the start
-(a match "from offset −1" has to be dropped, not underflow), non-overlapping
-matches, text encoded through each code page. Encodings: one cell per byte for
-all 256 values in every code page, UTF-8 resyncing after invalid bytes, wide
-characters refused. Layout and navigation: layout fitting the terminal width,
-formatting in every mode, rows in all three layouts, the view holding still
-while the cursor moves inside it, scrolling by exactly one row when it leaves,
-a page moving both so the cursor keeps its screen row,
-the grid slide surviving a file that fits on one screen, records cut and
-scrolled sideways versus wrapped, and the cursor surviving the file shrinking
-under it.
+71 tests.
+
+*The reader:* window buffer moves across boundaries, reads past the end of the
+file, a match landing exactly on a block seam searched forwards and backwards,
+a file appended to, truncated, and replaced by rename underneath a live window.
+
+*Patterns:* anchor choice with wildcards, a wildcard at the start (a match
+"from offset −1" has to be dropped, not underflow), non-overlapping matches,
+text encoded through each code page.
+
+*Encodings:* one cell per byte for all 256 values of every code page at both
+offset parities, every Cyrillic page decoding its own bytes, the Western pages
+differing where they should, UTF-8 resyncing after invalid bytes, UTF-16 byte
+orders and surrogate pairs, wide characters refused, and a query round-tripping
+through each page.
+
+*Layout and navigation:* layout fitting the terminal width at any chosen line
+width, formatting in every mode, rows in all three layouts, the view holding
+still while the cursor moves inside it, scrolling by exactly one row when it
+leaves, a page moving both so the cursor keeps its screen row, the grid slide
+surviving a file that fits on one screen, records cut and scrolled sideways
+versus wrapped, the line width keys stopping at their limits, and the cursor
+surviving the file shrinking under it.
 
 ## What could come next
 
