@@ -56,7 +56,7 @@ impl Pattern {
             s.strip_prefix("x:").or_else(|| s.strip_prefix("X:"))
         {
             let chars: Vec<char> = rest.chars().filter(|c| !c.is_whitespace()).collect();
-            if chars.is_empty() || chars.len() % 2 != 0 {
+            if chars.is_empty() || !chars.len().is_multiple_of(2) {
                 return Err(PatternError::BadHex);
             }
             let mut out = Vec::with_capacity(chars.len() / 2);

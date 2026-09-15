@@ -112,7 +112,8 @@ impl Encoding {
         }
     }
 
-    fn index(self) -> usize {
+    /// Where it sits in `ALL` — the picker needs it to open on the current page.
+    pub fn index(self) -> usize {
         Self::ALL.iter().position(|&e| e == self).unwrap_or(0)
     }
 

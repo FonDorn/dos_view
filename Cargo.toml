@@ -2,6 +2,8 @@
 name = "dosview"
 version = "0.1.0"
 edition = "2021"
+# usize::is_multiple_of
+rust-version = "1.87"
 description = "DOS-style terminal file viewer: binary / hex / text in CP437, CP866, CP1251, KOI8-R, UTF-8"
 license = "MIT"
 

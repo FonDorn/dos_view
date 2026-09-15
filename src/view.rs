@@ -113,6 +113,13 @@ pub fn format_offset(out: &mut String, offset: u64, digits: usize) {
 /// `glyph` is the byte's decoded text cell, already produced by the encoding
 /// layer; only the text mode uses it.
 ///
+/// Text mode draws a character once and skips its continuation bytes, so
+/// Cyrillic in UTF-8 reads as "привет" and not as "п·р·и·в·е·т·". It can do
+/// that because there is no byte column beside it to line up with — the text
+/// column of the byte modes keeps the continuation marks, where dropping them
+/// would put the two columns out of step. The line ends up shorter than its
+/// byte count, which is the honest picture: those bytes are one letter.
+///
 /// Formatting happens byte by byte rather than a whole line at a time because
 /// highlighting colours individual bytes, so a line is emitted in runs of
 /// different colours.
@@ -129,7 +136,11 @@ pub fn push_byte(out: &mut String, mode: Mode, b: u8, glyph: char) {
             }
             out.push(' ');
         }
-        Mode::Text => out.push(glyph),
+        Mode::Text => {
+            if glyph != crate::encoding::CONTINUATION {
+                out.push(glyph);
+            }
+        }
     }
 }
 
@@ -150,17 +161,24 @@ pub fn byte_width(mode: Mode) -> usize {
     }
 }
 
-/// Parse an offset typed by the user: `1000` is decimal, `0x1000` and `$1000`
-/// are hexadecimal.
+/// Parse an offset typed by the user.
+///
+/// Hexadecimal by default: every offset this viewer shows is hex, so `2A0` is
+/// the one thing "go to 2A0" can reasonably mean. `0x2A0`, `$2A0` and `2A0h`
+/// say the same thing for anyone whose fingers insist. A leading `d` — `d672` —
+/// is the way out to decimal.
 pub fn parse_offset(s: &str) -> Option<u64> {
     let s = s.trim();
-    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        u64::from_str_radix(hex, 16).ok()
-    } else if let Some(hex) = s.strip_prefix('$') {
-        u64::from_str_radix(hex, 16).ok()
-    } else {
-        s.parse::<u64>().ok()
+    if let Some(dec) = s.strip_prefix(|c| c == 'd' || c == 'D') {
+        return dec.trim().parse::<u64>().ok();
     }
+    let hex = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .or_else(|| s.strip_prefix('$'))
+        .unwrap_or(s);
+    let hex = hex.strip_suffix(|c| c == 'h' || c == 'H').unwrap_or(hex);
+    u64::from_str_radix(hex, 16).ok()
 }
 
 #[cfg(test)]
@@ -253,6 +271,27 @@ mod tests {
     }
 
     #[test]
+    fn text_mode_reads_as_text_not_as_letters_with_dots_between() {
+        // The complaint this fixes: UTF-8 Cyrillic used to come out as
+        // "П·р·и·в·е·т·" because every continuation byte claimed a cell.
+        let utf8 = "Привет".as_bytes();
+        assert_eq!(line(Mode::Text, Encoding::Utf8, utf8, utf8.len()), "Привет");
+        let utf16: Vec<u8> = "Ok".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        assert_eq!(line(Mode::Text, Encoding::Utf16Le, &utf16, utf16.len()), "Ok");
+    }
+
+    #[test]
+    fn the_text_column_of_a_byte_mode_still_marks_continuations() {
+        // There it has to: drop a cell and the text stops lining up with the
+        // bytes it belongs to. That column is drawn from the glyphs directly.
+        let mut glyphs = Vec::new();
+        encoding::decode(Encoding::Utf8, 0, "Привет".as_bytes(), &mut glyphs);
+        let column: String = glyphs.iter().collect();
+        assert_eq!(column, "П·р·и·в·е·т·");
+        assert_eq!(column.chars().count(), "Привет".len());
+    }
+
+    #[test]
     fn gap_width_matches_byte_width_in_every_mode() {
         for mode in [Mode::Hex, Mode::Binary, Mode::Text] {
             let mut a = String::new();
@@ -273,10 +312,29 @@ mod tests {
     }
 
     #[test]
-    fn offset_input_accepts_dec_and_hex() {
-        assert_eq!(parse_offset("1024"), Some(1024));
+    fn a_bare_offset_is_hex_because_every_offset_on_screen_is() {
+        assert_eq!(parse_offset("2A0"), Some(0x2A0));
+        assert_eq!(parse_offset("2a0"), Some(0x2A0));
         assert_eq!(parse_offset("0x4D5A"), Some(0x4D5A));
-        assert_eq!(parse_offset("$FF"), Some(255));
+        assert_eq!(parse_offset("$FF"), Some(0xFF));
+        assert_eq!(parse_offset("ffh"), Some(0xFF));
+        assert_eq!(parse_offset(" 1000 "), Some(0x1000));
+    }
+
+    #[test]
+    fn decimal_needs_saying_so() {
+        assert_eq!(parse_offset("d672"), Some(672));
+        assert_eq!(parse_offset("D672"), Some(672));
+        // 672 on its own is hex, and means something else entirely.
+        assert_eq!(parse_offset("672"), Some(0x672));
+    }
+
+    #[test]
+    fn nonsense_is_rejected() {
         assert_eq!(parse_offset("nonsense"), None);
+        assert_eq!(parse_offset(""), None);
+        assert_eq!(parse_offset("d"), None);
+        assert_eq!(parse_offset("0x"), None);
+        assert_eq!(parse_offset("2A0zz"), None);
     }
 }

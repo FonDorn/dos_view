@@ -24,30 +24,34 @@ comes out around 500 KB.4
 | `1` | binary mode — every byte as eight bits |
 | `2` | hex dump with a text column on the right |
 | `3` | text mode; press it again to step to the next code page |
+| `F3` or `#` | pick a code page from the list |
 | `e` `E` | next / previous code page, from any mode |
 | `[` `]` `\` | narrower / wider / window-wide data columns |
 | `←` `→` `↑` `↓` | move the cursor |
 | `Home` `End` | start / end of the file |
-| `Cmd+←` `Cmd+→` | start / end of the line (`Ctrl` or `Alt` also work) |
+| `Ctrl+A` `Ctrl+E`, or `^` `$` | start / end of the line |
 | `PgUp` `PgDn` | page up and down |
 | `Shift+←` `Shift+→` | slide the byte grid by one byte |
 | `5` or `F5` | go to offset |
-| `6` or `F6` | line = record: break lines on a pattern |
+| `6` or `F6` | format: break lines on a pattern |
 | `7` or `F7` | search |
 | `8` or `F8` | next match |
-| `9` or `F9` | wrap long records instead of cutting them |
+| `p` | previous match |
+| `Esc` | clear the search |
+| `9` or `F9` | wrap long formatted lines instead of cutting them |
 | `h` | toggle match highlighting |
 | `r` | reread the file now |
-| `q`, `Esc` or `F10` | quit |
+| `q` or `F10` | quit |
 
 `g`, `/` and `n` also work for goto, find and next.
 
-Cmd, Ctrl and Alt all do the same thing on the arrows because terminals cannot
-agree on which of them an application is allowed to see. Cmd is the one a Mac
-user reaches for and the hardest to actually get: Terminal.app and iTerm2 keep
-it for their own menus, and it only arrives in terminals that speak the kitty
-keyboard protocol and leave it alone — Ghostty, kitty, WezTerm. `Ctrl+←` and
-`Ctrl+→` work everywhere.
+The ends of a line are on `Ctrl+A` and `Ctrl+E` — and on `^` and `$` — rather
+than on a modified arrow, because that is what survives a Mac. macOS takes
+`Ctrl+←` and `Ctrl+→` for switching Spaces before any application sees them,
+and Terminal and iTerm2 keep `Cmd` for their own menus. `Cmd`, `Ctrl` or `Alt`
+with an arrow does work in the terminals that deliver it — Ghostty, kitty,
+WezTerm, which speak the kitty keyboard protocol — but a plain control
+character gets through everywhere.
 
 ## The cursor
 
@@ -65,10 +69,10 @@ Every field of the readout is a fixed width, code page name included. One that
 changed length as the cursor moved would shove the rest of the bar back and
 forth while you were trying to read it.
 
-`Home` and `End` take the whole file. The ends of a line are on the modified
-arrows, and in the record modes "the line" is the record — so `Cmd+→` on a
-record that runs off the screen walks the cursor to its last byte and brings
-the tail into view with it.
+`Home` and `End` take the whole file. `Ctrl+A` and `Ctrl+E` take the line, and
+with formatting on "the line" is the whole record — so `Ctrl+E` on a record
+that runs off the screen walks the cursor to its last byte and brings the tail
+into view with it.
 
 `Shift+←` and `Shift+→` are the one movement that is not the cursor's: they
 re-anchor the byte grid, so a structure that does not start on a line boundary
@@ -82,10 +86,11 @@ can be lined up. Every line moves together, by the same byte:
 
 ## Code pages
 
-`3` opens text mode, and every press after that steps to the next code page;
-`e` and `E` step forward and back from any mode. The choice drives both the
-text column of the byte modes and the full-screen text mode, so a hex dump of
-a Russian file reads as Cyrillic instead of dots:
+`3` opens text mode, and every press after that steps to the next code page.
+`F3` (or `#`) opens the whole list in a box to pick from, which beats stepping
+nineteen times; `e` and `E` step forward and back from any mode. The choice
+drives both the text column of the byte modes and the full-screen text mode, so
+a hex dump of a Russian file reads as Cyrillic instead of dots:
 
 ```
 00000000: CF F0 E8 E2 E5 F2 2C 20 EC E8 F0 21 20 48 65 6C  Привет, мир! Hel
@@ -115,6 +120,12 @@ Nineteen of them, in this order:
 | `UTF-16LE` | Windows text files, PE resources |
 | `UTF-16BE` | the other byte order |
 
+**A code page cannot rescue the wrong bytes.** If you write "привет" in a
+modern editor the file holds UTF-8, and no single-byte page will ever show it
+as Cyrillic — CP1251 will show `Ð¿Ñ€Ð¸Ð²ÐµÑ‚`, because that is honestly what
+those bytes say in CP1251. The page has to match how the file was written, and
+for anything recent that means UTF-8.
+
 Worth knowing, because mislabelled text usually turns out to be one of these:
 `CP1252` and `ISO-8859-1` differ only in 0x80..0x9F, where Windows put the
 smart quotes and dashes that ISO left as control codes. A great deal of what
@@ -133,12 +144,21 @@ continuation bytes get `·`:
 00000000: D0 9F D1 80 D0 B8 D0 B2 D0 B5 D1 82 2C 20 D0 BC  П·р·и·в·е·т·, м·
 ```
 
-Cyrillic text ends up twice as wide as it reads, which is the price of keeping
-cells addressable. Bytes that are not valid UTF-8 show as `.` and decoding
-resyncs on the next byte rather than guessing. East Asian characters are two
-columns wide and would shift the grid, so they are refused the same way — the
-bytes are still there in the dump, the viewer just does not pretend to draw
-them.
+That is the text column of a byte mode, where it has to be so: drop a cell and
+the text stops lining up with the bytes it belongs to. **Text mode has no byte
+column to line up with, so there it reads as text** — one cell per character,
+no marks in between:
+
+```
+00000000: привет, мир! Hello, world!
+```
+
+The line then holds fewer cells than it holds bytes, which is the honest
+picture: those bytes are one letter. Bytes that are not valid UTF-8 show as `.`
+and decoding resyncs on the next byte rather than guessing. East Asian
+characters are two columns wide and would shift the grid, so they are refused
+the same way — the bytes are still there in the dump, the viewer just does not
+pretend to draw them.
 
 UTF-16 takes its alignment from the file offset, not from wherever a line
 happened to start reading: the same four bytes one byte further along pair up
@@ -171,14 +191,28 @@ Switch the code page and the pattern is re-encoded; if the text does not exist
 in the new one (`Привет` in CP437, say) the old bytes are kept and the status
 line says so.
 
-Offsets for `5` are accepted in decimal (`1024`) or hex (`0x4D5A`, `$4D5A`).
+Every occurrence of the search pattern is highlighted in yellow, in the byte
+column and in the text column alike; `h` turns it off. While a search is live
+the bottom bar becomes the search's own — `8` next, `p` previous, both wrapping
+round the ends of the file — and `Esc` clears it. Only once there is no search
+to clear does `Esc` mean quit.
 
-## Line = record
+Offsets for `5` are **hexadecimal**, because every offset on the screen is:
+`2A0` goes to 0x2A0. `0x2A0`, `$2A0` and `2A0h` say the same thing, and a
+leading `d` is the way out to decimal — `d672`.
+
+## Formatting: lines that follow the file
 
 An ordinary dump cuts the file on a rigid grid, and variable-length records
-fall apart in it. `6` takes a record-start pattern, and from then on a line
-breaks at every occurrence: each record sits on its own line and line length
-becomes variable.
+fall apart in it. `6` — **Format** — takes a pattern that starts a record, and
+from then on a line breaks at every occurrence: each record sits on its own
+line and line length becomes variable.
+
+Mind the pattern syntax here, because it is the one place it bites: `0A` is the
+two-character *text* "0A", not the byte 0x0A. For bytes, `x:0A`. A pattern that
+occurs nowhere in the file is refused with that hint rather than accepted —
+accepting it would leave the whole file as one record on one line, which looks
+exactly like the viewer having ignored what you typed.
 
 ```
 00000000: 52 45 43 0C 41 42 43 44 45 46 47 48                          REC.ABCDEFGH
@@ -187,7 +221,8 @@ becomes variable.
 00000029: 52 45 43 1A 41 42 43 44 45 46 47 48 49 4A 4B 4C 4D 4E 4F 50 ›REC.ABCDEFGHIJKLMNOP
 ```
 
-`↑`, `↓`, `PgUp` and `PgDn` now move by records rather than by the grid — a
+With a format set, `↑`, `↓`, `PgUp` and `PgDn` move by records rather than by
+the grid — a
 step down is a search for the next occurrence, a step up a search backwards.
 That is what `find_backward` in `reader.rs` is for.
 
@@ -218,8 +253,10 @@ set the record pattern to `x:0A` and every line of the file becomes a line on
 screen, with `9` switching between wrapping long lines and scrolling them
 sideways.
 
-Every occurrence of the search pattern is highlighted in yellow, in the byte
-column and in the text column alike. `h` turns it off.
+Setting a format clears any search left over from before, so nothing is left
+highlighted that has nothing to do with the shape you just asked for. A search
+the other way round leaves the format alone: you go looking for something
+inside that shape, not instead of it.
 
 ## Following a file that changes
 
@@ -324,7 +361,7 @@ from the previous frame show through.
 cargo test
 ```
 
-71 tests.
+84 tests.
 
 *The reader:* window buffer moves across boundaries, reads past the end of the
 file, a match landing exactly on a block seam searched forwards and backwards,
@@ -340,13 +377,22 @@ differing where they should, UTF-8 resyncing after invalid bytes, UTF-16 byte
 orders and surrogate pairs, wide characters refused, and a query round-tripping
 through each page.
 
-*Layout and navigation:* layout fitting the terminal width at any chosen line
-width, formatting in every mode, rows in all three layouts, the view holding
-still while the cursor moves inside it, scrolling by exactly one row when it
-leaves, a page moving both so the cursor keeps its screen row, the grid slide
-surviving a file that fits on one screen, records cut and scrolled sideways
-versus wrapped, the line width keys stopping at their limits, and the cursor
-surviving the file shrinking under it.
+*Offsets and layout:* a bare offset read as hex and `d672` as decimal, nonsense
+rejected, layout fitting the terminal width at any chosen line width, the line
+width keys stopping at their limits, text mode reading as text while the byte
+modes' text column keeps its continuation marks.
+
+*Navigation:* rows in all three layouts, the view holding still while the
+cursor moves inside it, scrolling by exactly one row when it leaves, a page
+moving both so the cursor keeps its screen row, the grid slide surviving a file
+that fits on one screen, records cut and scrolled sideways versus wrapped, and
+the cursor surviving the file shrinking under it.
+
+*Search and formatting:* matches walked both ways and wrapping round, Escape
+backing out of a search before it quits, a format pattern that is nowhere
+refused with the hint that says why, a new format dropping a leftover search
+but not the other way round, and the code page list opening on the current page
+and leaving it alone when escaped.
 
 ## What could come next
 

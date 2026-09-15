@@ -72,6 +72,14 @@ enum Input {
     Goto(String),
     Search(String),
     Record(String),
+    /// The code page picker, holding what is currently highlighted in it.
+    ///
+    /// There are nineteen pages and stepping through them with 3 is fine for
+    /// the neighbours and tedious for the far side, so there is a list to pick
+    /// from. It is a dialog rather than a long press on 3 because a terminal
+    /// cannot tell an application how long a key was held: it reports a key,
+    /// and at best a repeat — never a duration.
+    Pick(usize),
 }
 
 /// One row of the layout: the bytes it logically holds, before the window
@@ -139,14 +147,16 @@ struct App {
     status: String,
     /// What we search for and what we highlight.
     needle: Option<Pattern>,
-    /// Record start pattern. When set, a row is a record and row length
-    /// becomes variable.
+    /// Format pattern — "Format" is what the key bar calls it. When set, a row
+    /// is one record of the file rather than a slice of the byte grid, and row
+    /// length becomes variable.
     record: Option<Pattern>,
     highlight: bool,
     /// Geometry of the last frame. Key handling runs right after a draw, so
     /// these are the numbers the user is actually looking at.
     rows: usize,
     bpl: usize,
+    width: usize,
     /// Scratch buffer for decoded text cells, reused across lines.
     glyphs: Vec<char>,
 }
@@ -174,6 +184,7 @@ impl App {
             highlight: true,
             rows: 1,
             bpl: 16,
+            width: 80,
             glyphs: Vec::new(),
         })
     }
@@ -618,6 +629,17 @@ impl App {
         };
     }
 
+    /// Open the code page list, if there is room on screen to draw it.
+    fn open_picker(&mut self) {
+        let (w, h) = (self.width, self.rows + 2);
+        let (bw, bh) = picker_size();
+        if w < bw + 2 || h < bh + 2 {
+            self.status = "Window too small for the list — 3 steps through the pages".into();
+            return;
+        }
+        self.input = Input::Pick(self.enc.index());
+    }
+
     /// Switch code page.
     ///
     /// Patterns keep the text they were typed as, so they are re-encoded: a
@@ -682,6 +704,7 @@ impl App {
 
         let lay = view::layout(self.mode, w, self.reader.len(), self.fixed_bpl);
         self.rows = (h as usize) - 2;
+        self.width = w as usize;
         self.bpl = lay.bpl;
         self.fit_bpl = lay.fit;
         self.align %= self.bpl64();
@@ -705,6 +728,9 @@ impl App {
         }
 
         self.draw_bottom(out, w, h)?;
+        if let Input::Pick(sel) = self.input {
+            self.draw_picker(out, w, h, sel)?;
+        }
         out.flush()
     }
 
@@ -763,15 +789,12 @@ impl App {
         // Read a little before the line: a match may have started on the
         // previous line and its tail needs highlighting too. The same context
         // also lets a multi-byte character that started earlier decode.
-        let lookback = if self.highlight {
-            [self.needle.as_ref(), self.record.as_ref()]
-                .into_iter()
-                .flatten()
-                .map(|p| p.len().saturating_sub(1))
-                .max()
-                .unwrap_or(0)
-        } else {
-            0
+        // Only a search is highlighted. The format pattern starts every record
+        // on screen, so painting it too would be a wall of yellow saying
+        // nothing the line breaks do not already say.
+        let lookback = match self.needle.as_ref().filter(|_| self.highlight) {
+            Some(p) => p.len().saturating_sub(1),
+            None => 0,
         }
         .max(encoding::LOOKAHEAD);
         let back = (lookback as u64).min(ln.off) as usize;
@@ -785,31 +808,35 @@ impl App {
         let body = back.min(data.len())..(back + ln.len).min(data.len());
         let bytes = &data[body];
 
-        let mut styles = vec![Style::Plain; ln.len];
-        if self.highlight {
-            for pat in [self.needle.as_ref(), self.record.as_ref()]
-                .into_iter()
-                .flatten()
-            {
-                let plen = pat.len();
-                for i in pat.find_all(data) {
-                    for k in i..i + plen {
-                        if k >= back && k - back < ln.len {
-                            styles[k - back] = Style::Match;
-                        }
-                    }
-                }
-            }
-        }
-        if self.cur >= ln.off && self.cur - ln.off < ln.len as u64 {
-            styles[(self.cur - ln.off) as usize] = Style::Cursor;
-        }
-
         // Decode from the context start so UTF-8 resyncs on real character
         // boundaries, then drop the context: cell i belongs to byte i.
         let mut glyphs = std::mem::take(&mut self.glyphs);
         encoding::decode(self.enc, ln.off - back as u64, data, &mut glyphs);
         let cells = &glyphs[back.min(glyphs.len())..];
+
+        let mut styles = vec![Style::Plain; ln.len];
+        if let Some(pat) = self.needle.as_ref().filter(|_| self.highlight) {
+            let plen = pat.len();
+            for i in pat.find_all(data) {
+                for k in i..i + plen {
+                    if k >= back && k - back < ln.len {
+                        styles[k - back] = Style::Match;
+                    }
+                }
+            }
+        }
+        if self.cur >= ln.off && self.cur - ln.off < ln.len as u64 {
+            let mut i = (self.cur - ln.off) as usize;
+            // Text mode draws a character once, on its first byte. A cursor
+            // sitting on a continuation byte has to light up that one cell, or
+            // it would have nowhere to show at all.
+            if mode == Mode::Text {
+                while i > 0 && cells.get(i).copied() == Some(encoding::CONTINUATION) {
+                    i -= 1;
+                }
+            }
+            styles[i] = Style::Cursor;
+        }
 
         let mut used = seg(out, FG_OFFSET, BG, &offset_s)?;
         used += if ln.skipped > 0 {
@@ -850,7 +877,7 @@ impl App {
         };
         let rec = match &self.record {
             Some(p) => format!(
-                " | {} {}",
+                " | fmt:{} {}",
                 clip(p.src(), 12),
                 if self.wrap { "wrap" } else { "cut" }
             ),
@@ -885,16 +912,27 @@ impl App {
         let mut used = 0;
 
         let prompt = match &self.input {
-            Input::Goto(buf) => Some((" Go to offset: ".to_string(), buf)),
+            Input::Goto(buf) => {
+                Some((" Go to offset (hex; d672 for decimal): ".to_string(), buf))
+            }
             Input::Search(buf) => Some((
                 format!(" Search in {} (x: for hex, ?? any byte): ", self.enc.name()),
                 buf,
             )),
-            Input::Record(buf) => {
-                Some((" Line = record, pattern (empty to turn off): ".to_string(), buf))
-            }
-            Input::Normal => None,
+            Input::Record(buf) => Some((
+                " Format — break lines at (text, or x:0A for bytes, empty to stop): "
+                    .to_string(),
+                buf,
+            )),
+            Input::Normal | Input::Pick(_) => None,
         };
+
+        // The picker types nothing, so it gets a hint rather than a prompt.
+        if let Input::Pick(_) = self.input {
+            let hint = " Code page — ↑↓←→ to choose, Enter to take it, Esc to leave it be ";
+            used += seg(out, BAR_FG, BAR_BG, hint)?;
+            return seg_fill(out, BAR_FG, BAR_BG, (w as usize).saturating_sub(used)).map(|_| ());
+        }
 
         match prompt {
             Some((label, buf)) => {
@@ -905,6 +943,20 @@ impl App {
             None => {
                 if !self.status.is_empty() {
                     used += seg(out, BAR_FG, BAR_BG, &format!(" {} ", self.status))?;
+                } else if self.needle.is_some() {
+                    // A live search takes the bar over: while you are walking
+                    // matches, those are the keys that matter.
+                    for (key, label) in [
+                        ("8", "Next"),
+                        ("p", "Prev"),
+                        ("7", "Find"),
+                        ("Esc", "Clear"),
+                        ("10", "Quit"),
+                    ] {
+                        used += seg(out, FG, BG, key)?;
+                        used += seg(out, BAR_FG, BAR_BG, label)?;
+                        used += seg(out, FG, BG, " ")?;
+                    }
                 } else {
                     // 3 doubles as the code page key, so it shows where it
                     // will take you next. Wrapping is only a thing once lines
@@ -914,7 +966,7 @@ impl App {
                         ("2", "Hex"),
                         ("3", if self.mode == Mode::Text { self.enc.name() } else { "Txt" }),
                         ("5", "Goto"),
-                        ("6", "Rec"),
+                        ("6", "Format"),
                         ("7", "Find"),
                         ("8", "Next"),
                     ];
@@ -934,16 +986,110 @@ impl App {
         Ok(())
     }
 
+    /// The code page list, drawn over the top of everything else the way a DOS
+    /// program put a dialog on the screen.
+    fn draw_picker(&self, out: &mut impl Write, w: u16, h: u16, sel: usize) -> io::Result<()> {
+        let all = Encoding::ALL;
+        let down = picker_rows();
+        let (bw, bh) = picker_size();
+        if (w as usize) < bw || (h as usize) < bh {
+            return Ok(());
+        }
+        let cell = Encoding::NAME_WIDTH + 4;
+        let inner = bw - 2;
+        let x = ((w as usize - bw) / 2) as u16;
+        let y = ((h as usize - bh) / 2) as u16;
+
+        queue!(out, MoveTo(x, y))?;
+        seg(out, BAR_FG, BAR_BG, &format!("╔{}╗", "═".repeat(inner)))?;
+        queue!(out, MoveTo(x, y + 1))?;
+        seg(out, BAR_FG, BAR_BG, &format!("║{:^inner$}║", "Code page"))?;
+        queue!(out, MoveTo(x, y + 2))?;
+        seg(out, BAR_FG, BAR_BG, &format!("╟{}╢", "─".repeat(inner)))?;
+
+        for r in 0..down {
+            queue!(out, MoveTo(x, y + 3 + r as u16))?;
+            seg(out, BAR_FG, BAR_BG, "║")?;
+            for c in 0..2 {
+                let i = c * down + r;
+                match all.get(i) {
+                    Some(&enc) => {
+                        // ▸ is where you are in the list, • is what the screen
+                        // behind the dialog is actually being drawn with.
+                        let mark = if i == sel {
+                            "▸"
+                        } else if enc == self.enc {
+                            "•"
+                        } else {
+                            " "
+                        };
+                        let text = format!(
+                            "{:<cell$}",
+                            format!("{} {:<name$} ", mark, enc.name(), name = Encoding::NAME_WIDTH)
+                        );
+                        if i == sel {
+                            seg(out, CUR_FG, CUR_BG, &text)?;
+                        } else {
+                            seg(out, BAR_FG, BAR_BG, &text)?;
+                        }
+                    }
+                    None => {
+                        seg_fill(out, BAR_FG, BAR_BG, cell)?;
+                    }
+                }
+            }
+            seg(out, BAR_FG, BAR_BG, "║")?;
+        }
+        queue!(out, MoveTo(x, y + 3 + down as u16))?;
+        seg(out, BAR_FG, BAR_BG, &format!("╚{}╝", "═".repeat(inner)))?;
+        Ok(())
+    }
+
     // ── Keyboard ─────────────────────────────────────────────────────────────
 
     /// Returns true when it is time to quit.
     fn on_key(&mut self, k: KeyEvent) -> io::Result<bool> {
-        if matches!(self.input, Input::Normal) {
-            self.on_key_normal(k)
-        } else {
-            self.on_key_prompt(k)?;
-            Ok(false)
+        match self.input {
+            Input::Normal => self.on_key_normal(k),
+            Input::Pick(_) => {
+                self.on_key_pick(k);
+                Ok(false)
+            }
+            _ => {
+                self.on_key_prompt(k)?;
+                Ok(false)
+            }
         }
+    }
+
+    fn on_key_pick(&mut self, k: KeyEvent) {
+        let all = Encoding::ALL;
+        let sel = match self.input {
+            Input::Pick(i) => i.min(all.len() - 1),
+            _ => return,
+        };
+        let down = picker_rows();
+        let next = match k.code {
+            KeyCode::Up => (sel + all.len() - 1) % all.len(),
+            KeyCode::Down => (sel + 1) % all.len(),
+            // The list is laid out in columns, so sideways is a column jump.
+            KeyCode::Left => sel.saturating_sub(down),
+            KeyCode::Right => (sel + down).min(all.len() - 1),
+            KeyCode::Home => 0,
+            KeyCode::End => all.len() - 1,
+            KeyCode::Enter => {
+                self.input = Input::Normal;
+                self.set_encoding(all[sel]);
+                return;
+            }
+            KeyCode::Esc => {
+                self.input = Input::Normal;
+                self.status = "Code page unchanged".into();
+                return;
+            }
+            _ => sel,
+        };
+        self.input = Input::Pick(next);
     }
 
     fn on_key_normal(&mut self, k: KeyEvent) -> io::Result<bool> {
@@ -955,17 +1101,33 @@ impl App {
         let page = self.rows.saturating_sub(1).max(1);
 
         match k.code {
+            // Escape backs out of a search first. Only once there is nothing
+            // to back out of does it mean "quit".
+            KeyCode::Esc if self.needle.is_some() => {
+                self.needle = None;
+                self.status = "Search cleared".into();
+            }
             KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc | KeyCode::F(10) => {
                 return Ok(true)
             }
             KeyCode::Char('c') if ctrl => return Ok(true),
+
+            // The ends of the line, on keys that actually arrive. macOS takes
+            // Ctrl+← and Ctrl+→ for switching Spaces and Terminal keeps Cmd for
+            // its own menus, so neither ever reaches us there — but Ctrl+A,
+            // Ctrl+E, ^ and $ are plain control and printable characters that
+            // no terminal or window manager wants for itself.
+            KeyCode::Char('a') if ctrl => self.go_row_edge(false)?,
+            KeyCode::Char('e') if ctrl => self.go_row_edge(true)?,
+            KeyCode::Char('^') => self.go_row_edge(false)?,
+            KeyCode::Char('$') => self.go_row_edge(true)?,
 
             KeyCode::Char('1') | KeyCode::F(1) => self.mode = Mode::Binary,
             KeyCode::Char('2') | KeyCode::F(2) => self.mode = Mode::Hex,
             // Text mode is also the code page key: the first press gets you
             // there, every press after that steps to the next page. There are
             // nineteen of them and nowhere near that many free keys.
-            KeyCode::Char('3') | KeyCode::F(3) => {
+            KeyCode::Char('3') => {
                 if self.mode == Mode::Text {
                     self.set_encoding(self.enc.next());
                 } else {
@@ -976,7 +1138,10 @@ impl App {
             }
             // Terminals disagree about whether a shifted letter arrives as
             // itself, as the modifier, or as both; take any of it.
-            KeyCode::Char('e') if !shift => self.set_encoding(self.enc.next()),
+            // Same key, bigger gesture: 3 steps to the next page, F3 opens the
+            // list of all of them.
+            KeyCode::F(3) | KeyCode::Char('#') => self.open_picker(),
+            KeyCode::Char('e') if !shift && !ctrl => self.set_encoding(self.enc.next()),
             KeyCode::Char('e') | KeyCode::Char('E') => self.set_encoding(self.enc.prev()),
             KeyCode::Char('9') | KeyCode::F(9) => self.toggle_wrap(),
             KeyCode::Char('[') => self.resize_line(false),
@@ -989,9 +1154,7 @@ impl App {
             // Sideways: the grid itself.
             KeyCode::Left if shift => self.shift_grid(false)?,
             KeyCode::Right if shift => self.shift_grid(true)?,
-            // The ends of the line. Cmd is what a Mac user reaches for, and
-            // Ctrl and Alt are what terminals actually manage to deliver, so
-            // any of the three will do it.
+            // And the arrows too, for the terminals that can deliver them.
             KeyCode::Left if sup || ctrl || alt => self.go_row_edge(false)?,
             KeyCode::Right if sup || ctrl || alt => self.go_row_edge(true)?,
             KeyCode::Left => self.move_cursor(-1)?,
@@ -1015,7 +1178,8 @@ impl App {
             KeyCode::Char('/') | KeyCode::Char('7') | KeyCode::F(7) => {
                 self.input = Input::Search(String::new())
             }
-            KeyCode::Char('n') | KeyCode::Char('8') | KeyCode::F(8) => self.find_next()?,
+            KeyCode::Char('n') | KeyCode::Char('8') | KeyCode::F(8) => self.search_step(true)?,
+            KeyCode::Char('p') | KeyCode::Char('N') => self.search_step(false)?,
             KeyCode::Char('r') => {
                 self.reload(false)?;
             }
@@ -1057,7 +1221,8 @@ impl App {
                 KeyCode::Esc => Action::Cancel,
                 _ => Action::Keep,
             },
-            Input::Normal => return Ok(()),
+            // Neither of these types anything; they are handled elsewhere.
+            Input::Normal | Input::Pick(_) => return Ok(()),
         };
 
         match action {
@@ -1076,56 +1241,50 @@ impl App {
                 Some(_) => self.status = "Offset is past the end of the file".into(),
                 None => self.status = "Not an offset: expected 1234 or 0x4D5A".into(),
             },
+            // A search leaves the formatting alone — you go looking for
+            // something inside the shape you set up, not instead of it.
             Input::Search(buf) => match Pattern::parse(&buf, self.enc) {
                 Ok(pat) => {
                     self.needle = Some(pat);
                     let from = self.cur;
-                    self.run_search(from)?;
+                    self.run_search(from, true)?;
                 }
-                Err(e) => self.status = format!("{} — pick a code page with 4", e),
+                Err(e) => self.status = format!("{} — pick a code page with 3", e),
             },
             Input::Record(buf) => {
                 if buf.trim().is_empty() {
                     self.record = None;
                     self.hoff = 0;
-                    self.status = "Record splitting off".into();
+                    self.status = "Formatting off — back to the byte grid".into();
                     self.ensure_visible()?;
                 } else {
                     match Pattern::parse(&buf, self.enc) {
-                        Ok(pat) => {
-                            self.status = format!(
-                                "Line = record on \"{}\" ({})",
-                                pat.src(),
-                                if self.wrap { "wrapped" } else { "one line each" }
-                            );
-                            self.record = Some(pat);
-                            self.hoff = 0;
-                            // Snap to the nearest record, otherwise the first
-                            // line would start in the middle of the previous
-                            // one.
-                            let rec = self.record_start(self.cur)?;
-                            self.top = rec;
-                            self.ensure_visible()?;
-                        }
-                        Err(e) => self.status = format!("{} — pick a code page with 4", e),
+                        Ok(pat) => self.set_format(pat)?,
+                        Err(e) => self.status = format!("{} — pick a code page with 3", e),
                     }
                 }
             }
-            Input::Normal => {}
+            Input::Normal | Input::Pick(_) => {}
         }
         Ok(())
     }
 
-    fn find_next(&mut self) -> io::Result<()> {
+    /// Step to the next or previous match from where the cursor is.
+    fn search_step(&mut self, forward: bool) -> io::Result<()> {
         if self.needle.is_none() {
             self.status = "Nothing to search for yet (7)".into();
             return Ok(());
         }
-        let from = self.cur.saturating_add(1);
-        self.run_search(from)
+        let from = if forward {
+            self.cur.saturating_add(1)
+        } else {
+            self.cur
+        };
+        self.run_search(from, forward)
     }
 
-    fn run_search(&mut self, from: u64) -> io::Result<()> {
+    fn run_search(&mut self, from: u64, forward: bool) -> io::Result<()> {
+        let len = self.reader.len();
         // The pattern borrow is held only for the search itself: after that a
         // &mut self is needed as a whole.
         let found = {
@@ -1133,30 +1292,108 @@ impl App {
                 Some(p) => p,
                 None => return Ok(()),
             };
-            match self.reader.search(from, pat)? {
-                Some(o) => Some((o, false)),
-                // Wrap around to the start, like "continue from the top?".
-                None => self
-                    .reader
-                    .search(0, pat)?
-                    .filter(|&o| o < from)
-                    .map(|o| (o, true)),
+            if forward {
+                match self.reader.search(from, pat)? {
+                    Some(o) => Some((o, false)),
+                    // Wrap round to the start, like "continue from the top?".
+                    None => self
+                        .reader
+                        .search(0, pat)?
+                        .filter(|&o| o < from)
+                        .map(|o| (o, true)),
+                }
+            } else {
+                match self.reader.find_backward(from, pat, 1)?.first().copied() {
+                    Some(o) => Some((o, false)),
+                    // Nothing behind us: wrap round to the last match instead.
+                    None => self
+                        .reader
+                        .find_backward(len, pat, 1)?
+                        .first()
+                        .copied()
+                        .filter(|&o| o >= from)
+                        .map(|o| (o, true)),
+                }
             }
         };
 
         match found {
             Some((off, wrapped)) => {
                 self.go_to(off)?;
-                self.status = if wrapped {
-                    format!("Wrapped to the start: {:#X}", off)
-                } else {
-                    format!("Found at {:#X}", off)
+                self.status = match (wrapped, forward) {
+                    (false, _) => format!("Found at {:#X}", off),
+                    (true, true) => format!("Wrapped to the start: {:#X}", off),
+                    (true, false) => format!("Wrapped to the end: {:#X}", off),
                 };
             }
             None => self.status = "Not found".into(),
         }
         Ok(())
     }
+
+    /// Take a format pattern: from here on a line is one record of the file.
+    ///
+    /// A pattern that occurs nowhere is refused rather than accepted. Accepting
+    /// it would leave the whole file as a single record on a single line, which
+    /// looks exactly like the viewer having ignored what you typed — and that
+    /// is what typing `0A` instead of `x:0A` gets you, since plain text is a
+    /// perfectly good pattern that simply is not in the file. The two searches
+    /// below cover the file between them, so "not found" means not anywhere.
+    fn set_format(&mut self, pat: Pattern) -> io::Result<()> {
+        let from = self.cur;
+        let start = {
+            let p = &pat;
+            match self
+                .reader
+                .find_backward(from.saturating_add(1), p, 1)?
+                .first()
+                .copied()
+            {
+                Some(o) => Some(o),
+                None => self.reader.find_forward(from, p, 1)?.first().copied(),
+            }
+        };
+
+        let start = match start {
+            Some(o) => o,
+            None => {
+                let src = pat.src();
+                let hint = if src.len().is_multiple_of(2) && src.chars().all(|c| c.is_ascii_hexdigit()) {
+                    format!(" — for the bytes {}, write x:{}", src, src)
+                } else {
+                    String::new()
+                };
+                self.status = format!("\"{}\" is nowhere in the file{}", src, hint);
+                return Ok(());
+            }
+        };
+
+        // A search from before would go on highlighting hits that have nothing
+        // to do with the format just asked for.
+        self.needle = None;
+        self.hoff = 0;
+        // Start on a record boundary, or the first line would begin in the
+        // middle of the previous record.
+        self.top = start;
+        self.status = format!(
+            "Lines break at \"{}\" ({})",
+            pat.src(),
+            if self.wrap { "wrapped" } else { "one line each" }
+        );
+        self.record = Some(pat);
+        self.ensure_visible()
+    }
+}
+
+/// How many rows the code page list needs, in two columns.
+fn picker_rows() -> usize {
+    Encoding::ALL.len().div_ceil(2)
+}
+
+/// Width and height of the code page box, in cells: two columns of
+/// "▸ NAME  " inside a border, with a title and a rule above them.
+fn picker_size() -> (usize, usize) {
+    ((Encoding::NAME_WIDTH + 4) * 2 + 2, picker_rows() + 4)
 }
 
 // ── Small output helpers ─────────────────────────────────────────────────────
@@ -1247,17 +1484,19 @@ fn main() {
             eprintln!("Usage: dosview <file>\n");
             eprintln!("  1/2          mode: binary, hex");
             eprintln!("  3            text mode; again for the next of 19 code pages");
+            eprintln!("  F3 or #      pick a code page from the list");
             eprintln!("  [ ] \\        narrower / wider / window-wide data columns");
             eprintln!("  ←→↑↓         move the cursor");
             eprintln!("  Home/End     start / end of the file");
-            eprintln!("  Cmd/Ctrl/Alt+←→  start / end of the line");
+            eprintln!("  Ctrl+A / Ctrl+E  start / end of the line (also ^ and $)");
             eprintln!("  PgUp/PgDn    page up and down");
             eprintln!("  Shift+←→     slide the byte grid (for unaligned structures)");
-            eprintln!("  g or F5      go to offset");
-            eprintln!("  6 or F6      line = record: break lines on a pattern");
-            eprintln!("  9 or F9      wrap long records instead of cutting them");
-            eprintln!("  / or F7      search; x: for hex bytes, ?? for any byte");
-            eprintln!("  n or F8      next match");
+            eprintln!("  5 or F5      go to offset — hex, so 2A0; d672 for decimal");
+            eprintln!("  6 or F6      format: break lines on a pattern, e.g. x:0A");
+            eprintln!("  9 or F9      wrap long formatted lines instead of cutting them");
+            eprintln!("  7 or F7      search; x: for hex bytes, ?? for any byte");
+            eprintln!("  8 or F8      next match; p for the previous one");
+            eprintln!("  Esc          clear the search");
             eprintln!("  h            toggle match highlighting");
             eprintln!("  r            reread the file now (it is also watched while idle)");
             eprintln!("  q or F10     quit");
@@ -1608,6 +1847,131 @@ mod tests {
         // restoring the one from two rows up.
         a.step_rows(1, true).unwrap();
         assert_eq!(a.cur, 14 + 3);
+    }
+
+    fn needle(a: &mut App, text: &str) {
+        a.needle = Some(Pattern::parse(text, Encoding::Ascii).unwrap());
+    }
+
+    #[test]
+    fn search_walks_matches_both_ways_and_wraps_round() {
+        let (_d, mut a) = app(b"--AB--AB--AB--");
+        needle(&mut a, "AB");
+
+        a.search_step(true).unwrap();
+        assert_eq!(a.cur, 2);
+        a.search_step(true).unwrap();
+        assert_eq!(a.cur, 6);
+        a.search_step(false).unwrap();
+        assert_eq!(a.cur, 2, "back to the one before");
+
+        // Off the front, round to the last.
+        a.search_step(false).unwrap();
+        assert_eq!(a.cur, 10);
+        assert!(a.status.contains("Wrapped to the end"));
+
+        // And off the back, round to the first.
+        a.search_step(true).unwrap();
+        assert_eq!(a.cur, 2);
+        assert!(a.status.contains("Wrapped to the start"));
+    }
+
+    #[test]
+    fn stepping_matches_needs_a_search_first() {
+        let (_d, mut a) = app(b"--AB--");
+        a.search_step(true).unwrap();
+        assert_eq!(a.cur, 0);
+        assert!(a.status.contains("Nothing to search for"));
+    }
+
+    #[test]
+    fn escape_backs_out_of_a_search_before_it_quits() {
+        let (_d, mut a) = app(b"--AB--");
+        needle(&mut a, "AB");
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+        assert!(!a.on_key(esc).unwrap(), "the first Escape clears the search");
+        assert!(a.needle.is_none());
+        assert!(a.on_key(esc).unwrap(), "with nothing to clear, it quits");
+    }
+
+    #[test]
+    fn a_format_pattern_that_is_nowhere_is_refused() {
+        // What typing 0A instead of x:0A does: a perfectly good text pattern
+        // that simply is not in the file. Accepting it would put the whole
+        // file on one line, which reads as the viewer ignoring you.
+        let (_d, mut a) = app(b"REC-one\nREC-two\n");
+        a.set_format(Pattern::parse("0A", Encoding::Ascii).unwrap()).unwrap();
+        assert!(a.record.is_none(), "not accepted");
+        assert!(a.status.contains("nowhere in the file"));
+        assert!(a.status.contains("x:0A"), "and it says what to type instead");
+
+        // The same bytes asked for as bytes do exist.
+        a.set_format(Pattern::parse("x:0A", Encoding::Ascii).unwrap()).unwrap();
+        assert!(a.record.is_some());
+    }
+
+    #[test]
+    fn a_new_format_drops_a_leftover_search_but_not_the_other_way_round() {
+        let (_d, mut a) = app(b"REC-one-REC-two");
+        needle(&mut a, "one");
+
+        a.set_format(Pattern::parse("REC", Encoding::Ascii).unwrap()).unwrap();
+        assert!(a.needle.is_none(), "nothing left highlighted from before");
+        assert!(a.record.is_some());
+
+        // A search inside a formatted view keeps the formatting: you are
+        // looking for something within the shape you set up.
+        needle(&mut a, "two");
+        assert!(a.record.is_some());
+    }
+
+    #[test]
+    fn setting_a_format_lands_on_a_record_boundary() {
+        let (_d, mut a) = app(b"..REC-one-REC-two");
+        a.go_to(14).unwrap();
+        a.set_format(Pattern::parse("REC", Encoding::Ascii).unwrap()).unwrap();
+        assert_eq!(a.top, 10, "the record the cursor was in, not mid-record");
+    }
+
+    #[test]
+    fn the_code_page_list_opens_on_the_current_page_and_takes_a_pick() {
+        let (_d, mut a) = app(b"whatever");
+        a.width = 90;
+        a.rows = 22;
+        a.set_encoding(Encoding::Cp1251);
+        a.open_picker();
+        assert!(matches!(a.input, Input::Pick(i) if i == Encoding::Cp1251.index()));
+
+        // Down the column, then across to the other one, then take it.
+        a.on_key_pick(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        a.on_key_pick(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        let want = Encoding::ALL[Encoding::Cp1251.index() + 1 + picker_rows()];
+        a.on_key_pick(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(a.input, Input::Normal));
+        assert_eq!(a.enc, want);
+    }
+
+    #[test]
+    fn escaping_the_code_page_list_changes_nothing() {
+        let (_d, mut a) = app(b"whatever");
+        a.width = 90;
+        a.rows = 22;
+        a.open_picker();
+        a.on_key_pick(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        a.on_key_pick(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(a.input, Input::Normal));
+        assert_eq!(a.enc, Encoding::Ascii);
+    }
+
+    #[test]
+    fn a_window_too_short_for_the_list_says_so_instead_of_drawing_rubbish() {
+        let (_d, mut a) = app(b"whatever");
+        a.width = 90;
+        a.rows = 4;
+        a.open_picker();
+        assert!(matches!(a.input, Input::Normal));
+        assert!(a.status.contains("too small"));
     }
 
     #[test]
