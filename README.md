@@ -1,4 +1,3 @@
-привет
 # dosview
 
 A DOS-style file viewer for the terminal: offset column on the left, data on

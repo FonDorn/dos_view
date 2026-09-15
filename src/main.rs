@@ -916,6 +916,38 @@ impl App {
         Ok(())
     }
 
+    /// The keys the bottom bar offers.
+    ///
+    /// A slot for something that would do nothing is left out rather than
+    /// shown dead: there is nothing to step to before a search, and nothing to
+    /// wrap before lines are records. A live search takes the bar over for as
+    /// long as it lasts, since walking matches is what you are doing.
+    fn bar_slots(&self) -> Vec<(&'static str, &'static str)> {
+        if self.needle.is_some() {
+            return vec![
+                ("8", "Next"),
+                ("p", "Prev"),
+                ("7", "Find"),
+                ("Esc", "Clear"),
+                ("10", "Quit"),
+            ];
+        }
+        // 3 doubles as the code page key, so it shows where it will take you.
+        let mut slots = vec![
+            ("1", "Bin"),
+            ("2", "Hex"),
+            ("3", if self.mode == Mode::Text { self.enc.name() } else { "Txt" }),
+            ("5", "Goto"),
+            ("6", "Format"),
+            ("7", "Find"),
+        ];
+        if self.record.is_some() {
+            slots.push(("9", if self.wrap { "Wrap" } else { "Cut" }));
+        }
+        slots.push(("10", "Quit"));
+        slots
+    }
+
     fn draw_bottom(&self, out: &mut impl Write, w: u16, h: u16) -> io::Result<()> {
         queue!(out, MoveTo(0, h - 1))?;
         let mut used = 0;
@@ -952,38 +984,8 @@ impl App {
             None => {
                 if !self.status.is_empty() {
                     used += seg(out, BAR_FG, BAR_BG, &format!(" {} ", self.status))?;
-                } else if self.needle.is_some() {
-                    // A live search takes the bar over: while you are walking
-                    // matches, those are the keys that matter.
-                    for (key, label) in [
-                        ("8", "Next"),
-                        ("p", "Prev"),
-                        ("7", "Find"),
-                        ("Esc", "Clear"),
-                        ("10", "Quit"),
-                    ] {
-                        used += seg(out, FG, BG, key)?;
-                        used += seg(out, BAR_FG, BAR_BG, label)?;
-                        used += seg(out, FG, BG, " ")?;
-                    }
                 } else {
-                    // 3 doubles as the code page key, so it shows where it
-                    // will take you next. Wrapping is only a thing once lines
-                    // are records, so its slot is simply absent until then.
-                    let mut slots = vec![
-                        ("1", "Bin"),
-                        ("2", "Hex"),
-                        ("3", if self.mode == Mode::Text { self.enc.name() } else { "Txt" }),
-                        ("5", "Goto"),
-                        ("6", "Format"),
-                        ("7", "Find"),
-                        ("8", "Next"),
-                    ];
-                    if self.record.is_some() {
-                        slots.push(("9", if self.wrap { "Wrap" } else { "Cut" }));
-                    }
-                    slots.push(("10", "Quit"));
-                    for (key, label) in slots {
+                    for (key, label) in self.bar_slots() {
                         used += seg(out, FG, BG, key)?;
                         used += seg(out, BAR_FG, BAR_BG, label)?;
                         used += seg(out, FG, BG, " ")?;
@@ -1910,6 +1912,29 @@ mod tests {
 
     fn needle(a: &mut App, text: &str) {
         a.needle = Some(Pattern::parse(text, Encoding::Ascii).unwrap());
+    }
+
+    #[test]
+    fn the_bar_only_offers_keys_that_would_do_something() {
+        let (_d, mut a) = app(b"REC-one-REC-two");
+        let labels = |a: &App| -> Vec<&str> { a.bar_slots().iter().map(|&(_, l)| l).collect() };
+
+        // At startup there is nothing to step to and nothing to wrap.
+        let start = labels(&a);
+        assert!(!start.contains(&"Next"), "nothing has been searched for yet");
+        assert!(!start.contains(&"Prev"));
+        assert!(!start.contains(&"Wrap") && !start.contains(&"Cut"));
+        assert!(start.contains(&"Find"));
+
+        a.set_format(Pattern::parse("REC", Encoding::Ascii).unwrap()).unwrap();
+        assert!(labels(&a).contains(&"Cut"), "now wrapping means something");
+
+        needle(&mut a, "one");
+        let searching = labels(&a);
+        assert!(searching.contains(&"Next"));
+        assert!(searching.contains(&"Prev"));
+        assert!(searching.contains(&"Clear"));
+        assert!(!searching.contains(&"Bin"), "a live search owns the bar");
     }
 
     #[test]
