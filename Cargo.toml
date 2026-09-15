@@ -1,0 +1,17 @@
+[package]
+name = "dosview"
+version = "0.1.0"
+edition = "2021"
+description = "DOS-style terminal file viewer: binary / hex / text in CP437, CP866, CP1251, KOI8-R, UTF-8"
+license = "MIT"
+
+[dependencies]
+crossterm = "0.28"
+memchr = "2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
