@@ -321,6 +321,13 @@ A UTF-8 character can straddle a line break, so each line is decoded with a few
 bytes of context on either side. Without the lead-in the first letter of every
 line would decode as garbage; without the lookahead the last one would.
 
+The limit on how far the view scrolls is measured from the row the last byte
+sits on, not from the file length. They are the same number only when the
+length is a whole multiple of the line width; the rest of the time, measuring
+from the length stops the view one row short, the final partial row can never
+be brought on screen, and a cursor sent there has nowhere to be drawn — so it
+just disappears at the end of the file.
+
 The grid anchor is state of its own, not `top % bpl`. Deriving it looked
 tempting and was wrong: `top` gets clamped, snapped and scrolled for all sorts
 of reasons, and each of those quietly threw the slide away — visibly so on a
@@ -361,7 +368,7 @@ from the previous frame show through.
 cargo test
 ```
 
-84 tests.
+86 tests.
 
 *The reader:* window buffer moves across boundaries, reads past the end of the
 file, a match landing exactly on a block seam searched forwards and backwards,
@@ -382,7 +389,9 @@ rejected, layout fitting the terminal width at any chosen line width, the line
 width keys stopping at their limits, text mode reading as text while the byte
 modes' text column keeps its continuation marks.
 
-*Navigation:* rows in all three layouts, the view holding still while the
+*Navigation:* rows in all three layouts, the last row of a file that is not a
+whole number of rows being reachable while the view still stops at the last
+screenful, the view holding still while the
 cursor moves inside it, scrolling by exactly one row when it leaves, a page
 moving both so the cursor keeps its screen row, the grid slide surviving a file
 that fits on one screen, records cut and scrolled sideways versus wrapped, and

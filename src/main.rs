@@ -369,25 +369,34 @@ impl App {
 
     // ── Navigation ───────────────────────────────────────────────────────────
 
-    /// Keep `top` from running off the end. In the plain modes it stops at the
-    /// last full screen: otherwise a jump near the end would leave a mostly
-    /// empty screen and the next key would snap backwards.
+    /// Keep `top` from running off the end: the view stops once the file's last
+    /// row is the bottom one on screen. That way a jump near the end does not
+    /// leave a mostly empty screen, and the next key does not snap backwards.
+    ///
+    /// The limit is measured from the row the last byte is on, not from the
+    /// file length. Those differ whenever the length is not a whole number of
+    /// rows — and then measuring from the length stops the view a row short,
+    /// so the final partial row can never be reached and a cursor on it has
+    /// nowhere to be drawn.
     fn clamp_top(&mut self) {
         let len = self.reader.len();
         if self.record.is_some() {
             self.top = self.top.min(len);
             return;
         }
+        if len == 0 {
+            self.top = 0;
+            return;
+        }
         let bpl = self.bpl64();
         let align = self.align;
-        let want = len.saturating_sub(self.rows as u64 * bpl);
-        // Round down to a row start, and never below the anchor itself: a file
-        // that fits on one screen would otherwise undo the slide immediately.
-        let max = if want <= align {
-            align.min(len)
+        let last = len - 1;
+        let last_row = if last < align {
+            0
         } else {
-            align + ((want - align) / bpl) * bpl
+            align + ((last - align) / bpl) * bpl
         };
+        let max = last_row.saturating_sub((self.rows as u64).saturating_sub(1) * bpl);
         self.top = self.top.min(max);
     }
 
@@ -1682,6 +1691,51 @@ mod tests {
     }
 
     #[test]
+    fn the_last_row_of_a_file_that_is_not_a_whole_number_of_rows_is_reachable() {
+        // 4 rows of 8 on a 21-byte file: the last row holds the single byte at
+        // offset 16. Stopping the view a row short of it — which measuring the
+        // limit from the file length does — leaves the cursor nowhere to be
+        // drawn, so it simply vanishes at the end of the file.
+        let (_d, mut a) = app(&(0..21u8).collect::<Vec<_>>());
+
+        a.go_end().unwrap();
+        assert_eq!(a.cur, 20);
+        let rows = a.layout_rows(a.rows).unwrap();
+        let last = rows.last().copied().unwrap();
+        assert!(last.start <= 20 && 20 < last.start + last.len, "cursor on screen");
+
+        // Walking there a row at a time has to reach it too.
+        a.go_to(0).unwrap();
+        a.step_rows(1, true).unwrap();
+        a.step_rows(1, true).unwrap();
+        assert_eq!(a.cur, 16, "the last row, not one short of it");
+        let rows = a.layout_rows(a.rows).unwrap();
+        assert!(rows.iter().any(|r| r.start == 16), "and it is on screen");
+        // One more step has nowhere further to go, so it runs to the end.
+        a.step_rows(1, true).unwrap();
+        assert_eq!(a.cur, 20);
+
+        // Same going right off the end of the second-to-last row.
+        a.go_to(15).unwrap();
+        a.move_cursor(1).unwrap();
+        assert_eq!(a.cur, 16);
+        let rows = a.layout_rows(a.rows).unwrap();
+        assert!(rows.iter().any(|r| r.start == 16));
+    }
+
+    #[test]
+    fn the_view_still_stops_at_the_last_screenful() {
+        // A file that is a whole number of rows must behave as it always did:
+        // the bottom row of the last screen is the last row of the file, with
+        // no blank rows past it.
+        let (_d, mut a) = app(&(0..64u8).collect::<Vec<_>>());
+        a.go_end().unwrap();
+        assert_eq!((a.cur, a.top), (63, 32), "four rows of eight, ending at 63");
+        a.scroll_rows(5, true).unwrap();
+        assert_eq!(a.top, 32, "and it will not scroll past that");
+    }
+
+    #[test]
     fn stepping_down_keeps_the_column() {
         let (_d, mut a) = app(&(0..64u8).collect::<Vec<_>>());
         a.go_to(3).unwrap();
@@ -1763,10 +1817,15 @@ mod tests {
         let (_d, mut a) = app(&(0..12u8).collect::<Vec<_>>());
         a.shift_grid(true).unwrap();
         a.shift_grid(true).unwrap();
-        assert_eq!((a.align, a.top), (2, 2));
+        assert_eq!(a.align, 2, "the anchor moved and stayed moved");
+        // Every row boundary moved with it...
         assert_eq!(row(&mut a, 2), (2, 8));
+        assert_eq!(row(&mut a, 10), (10, 2));
+        // ...and the bytes below the anchor are a short row of their own
+        // rather than bytes the view can no longer reach.
+        assert_eq!(row(&mut a, 0), (0, 2));
         a.shift_grid(false).unwrap();
-        assert_eq!((a.align, a.top), (1, 1));
+        assert_eq!(a.align, 1);
     }
 
     #[test]
