@@ -14,11 +14,15 @@ mod view;
 
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
     execute, queue,
     style::{Color, Print, SetBackgroundColor, SetForegroundColor},
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
@@ -126,6 +130,11 @@ struct App {
     /// Wrap a long record onto as many lines as it needs, instead of cutting
     /// it at the window edge.
     wrap: bool,
+    /// A line width the user asked for, in bytes. `None` fills the window.
+    fixed_bpl: Option<usize>,
+    /// The widest line the window can hold right now — the ceiling the line
+    /// width keys stop at. Measured by the last frame.
+    fit_bpl: usize,
     input: Input,
     status: String,
     /// What we search for and what we highlight.
@@ -156,6 +165,8 @@ impl App {
             cur: 0,
             hoff: 0,
             wrap: false,
+            fixed_bpl: None,
+            fit_bpl: 16,
             input: Input::Normal,
             status: String::new(),
             needle: None,
@@ -567,6 +578,33 @@ impl App {
 
     // ── State the keys flip ──────────────────────────────────────────────────
 
+    /// Make the data columns narrower or wider.
+    ///
+    /// Both columns show the same bytes, so the bytes on a line is the only
+    /// dial there is: fewer of them and the dump — text column and all — takes
+    /// up less of the window. The mode's own limits and the window width are
+    /// the stops.
+    fn resize_line(&mut self, wider: bool) {
+        if self.mode == Mode::Text {
+            self.status = "Line width is for the byte modes (1, 2)".into();
+            return;
+        }
+        let (min, _) = view::limits(self.mode);
+        let step = view::step(self.mode);
+        let want = if wider {
+            self.bpl + step
+        } else {
+            self.bpl.saturating_sub(step)
+        };
+        let want = want.clamp(min, self.fit_bpl.max(min));
+        self.fixed_bpl = Some(want);
+        self.status = if want == self.fit_bpl {
+            format!("{} bytes per line — the whole window", want)
+        } else {
+            format!("{} bytes per line", want)
+        };
+    }
+
     fn toggle_wrap(&mut self) {
         self.wrap = !self.wrap;
         if self.wrap {
@@ -642,15 +680,16 @@ impl App {
             return out.flush();
         }
 
-        let lay = view::layout(self.mode, w, self.reader.len());
+        let lay = view::layout(self.mode, w, self.reader.len(), self.fixed_bpl);
         self.rows = (h as usize) - 2;
         self.bpl = lay.bpl;
+        self.fit_bpl = lay.fit;
         self.align %= self.bpl64();
         // The terminal may have been resized since the last frame, which moves
         // every row boundary; re-settle the view before measuring anything.
         self.ensure_visible()?;
 
-        let readout = self.cursor_readout()?;
+        let readout = self.cursor_readout(lay.offset_digits)?;
         self.draw_title(out, w, &readout)?;
 
         let rows = self.layout_rows(self.rows)?;
@@ -670,9 +709,15 @@ impl App {
     }
 
     /// The byte under the cursor, as hex, decimal and a text cell.
-    fn cursor_readout(&mut self) -> io::Result<String> {
+    ///
+    /// Every field is a fixed width. A readout that changed length as the
+    /// cursor moved would shove everything beside it back and forth on the
+    /// title bar, which is unreadable while you are trying to read it.
+    fn cursor_readout(&mut self, digits: usize) -> io::Result<String> {
+        // "0x" + offset + " " + hex + " " + decimal + " " + quoted glyph
+        let width = digits + 13;
         if self.reader.len() == 0 {
-            return Ok("empty".into());
+            return Ok(format!("{:<width$}", "empty file"));
         }
         // A few bytes of context so a UTF-8 character the cursor sits inside
         // still decodes.
@@ -683,13 +728,20 @@ impl App {
         let idx = back as usize;
         let b = match data.get(idx) {
             Some(&b) => b,
-            None => return Ok("empty".into()),
+            None => return Ok(format!("{:<width$}", "past the end")),
         };
         let mut glyphs = std::mem::take(&mut self.glyphs);
-        encoding::decode(self.enc, data, &mut glyphs);
+        encoding::decode(self.enc, self.cur - back, data, &mut glyphs);
         let glyph = glyphs.get(idx).copied().unwrap_or(' ');
         self.glyphs = glyphs;
-        Ok(format!("{:#X} {:02X} {} {}", self.cur, b, b, glyph))
+        Ok(format!(
+            "{:#0off$X} {:02X} {:>3} '{}'",
+            self.cur,
+            b,
+            b,
+            glyph,
+            off = digits + 2
+        ))
     }
 
     fn draw_line(
@@ -756,7 +808,7 @@ impl App {
         // Decode from the context start so UTF-8 resyncs on real character
         // boundaries, then drop the context: cell i belongs to byte i.
         let mut glyphs = std::mem::take(&mut self.glyphs);
-        encoding::decode(self.enc, data, &mut glyphs);
+        encoding::decode(self.enc, ln.off - back as u64, data, &mut glyphs);
         let cells = &glyphs[back.min(glyphs.len())..];
 
         let mut used = seg(out, FG_OFFSET, BG, &offset_s)?;
@@ -804,14 +856,17 @@ impl App {
             ),
             None => String::new(),
         };
+        // Mode and code page are padded for the same reason the readout is:
+        // stepping through code pages should not shuffle the bar sideways.
         let right = format!(
-            " {} {}{} | {} | {} bytes | {}% ",
+            " {:<4} {:<enc$}{} | {} | {} bytes | {:>3}% ",
             self.mode.name(),
             self.enc.name(),
             rec,
             readout,
             len,
-            percent
+            percent,
+            enc = Encoding::NAME_WIDTH
         );
         let room = (w as usize).saturating_sub(right.chars().count() + 1);
         let left = format!(" {}", trim_left(&self.name, room.saturating_sub(1)));
@@ -851,18 +906,23 @@ impl App {
                 if !self.status.is_empty() {
                     used += seg(out, BAR_FG, BAR_BG, &format!(" {} ", self.status))?;
                 } else {
-                    for (key, label) in [
+                    // 3 doubles as the code page key, so it shows where it
+                    // will take you next. Wrapping is only a thing once lines
+                    // are records, so its slot is simply absent until then.
+                    let mut slots = vec![
                         ("1", "Bin"),
                         ("2", "Hex"),
-                        ("3", "Txt"),
-                        ("4", self.enc.name()),
+                        ("3", if self.mode == Mode::Text { self.enc.name() } else { "Txt" }),
                         ("5", "Goto"),
                         ("6", "Rec"),
                         ("7", "Find"),
                         ("8", "Next"),
-                        ("9", if self.wrap { "Wrap" } else { "Cut" }),
-                        ("10", "Quit"),
-                    ] {
+                    ];
+                    if self.record.is_some() {
+                        slots.push(("9", if self.wrap { "Wrap" } else { "Cut" }));
+                    }
+                    slots.push(("10", "Quit"));
+                    for (key, label) in slots {
                         used += seg(out, FG, BG, key)?;
                         used += seg(out, BAR_FG, BAR_BG, label)?;
                         used += seg(out, FG, BG, " ")?;
@@ -891,6 +951,7 @@ impl App {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
         let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+        let sup = k.modifiers.contains(KeyModifiers::SUPER);
         let page = self.rows.saturating_sub(1).max(1);
 
         match k.code {
@@ -901,19 +962,38 @@ impl App {
 
             KeyCode::Char('1') | KeyCode::F(1) => self.mode = Mode::Binary,
             KeyCode::Char('2') | KeyCode::F(2) => self.mode = Mode::Hex,
-            KeyCode::Char('3') | KeyCode::F(3) => self.mode = Mode::Text,
-            KeyCode::Char('4') | KeyCode::Char('e') | KeyCode::F(4) => {
-                self.set_encoding(self.enc.next())
+            // Text mode is also the code page key: the first press gets you
+            // there, every press after that steps to the next page. There are
+            // nineteen of them and nowhere near that many free keys.
+            KeyCode::Char('3') | KeyCode::F(3) => {
+                if self.mode == Mode::Text {
+                    self.set_encoding(self.enc.next());
+                } else {
+                    self.mode = Mode::Text;
+                    self.status =
+                        format!("Text in {} — 3 again for the next code page", self.enc.name());
+                }
             }
-            KeyCode::Char('E') => self.set_encoding(self.enc.prev()),
+            // Terminals disagree about whether a shifted letter arrives as
+            // itself, as the modifier, or as both; take any of it.
+            KeyCode::Char('e') if !shift => self.set_encoding(self.enc.next()),
+            KeyCode::Char('e') | KeyCode::Char('E') => self.set_encoding(self.enc.prev()),
             KeyCode::Char('9') | KeyCode::F(9) => self.toggle_wrap(),
+            KeyCode::Char('[') => self.resize_line(false),
+            KeyCode::Char(']') => self.resize_line(true),
+            KeyCode::Char('\\') => {
+                self.fixed_bpl = None;
+                self.status = "Line width: as wide as the window".into();
+            }
 
-            // Sideways: the grid itself. Alt or Ctrl jumps to the ends of the
-            // line, which is Alt in most terminals and Ctrl in the rest.
+            // Sideways: the grid itself.
             KeyCode::Left if shift => self.shift_grid(false)?,
             KeyCode::Right if shift => self.shift_grid(true)?,
-            KeyCode::Left if alt || ctrl => self.go_row_edge(false)?,
-            KeyCode::Right if alt || ctrl => self.go_row_edge(true)?,
+            // The ends of the line. Cmd is what a Mac user reaches for, and
+            // Ctrl and Alt are what terminals actually manage to deliver, so
+            // any of the three will do it.
+            KeyCode::Left if sup || ctrl || alt => self.go_row_edge(false)?,
+            KeyCode::Right if sup || ctrl || alt => self.go_row_edge(true)?,
             KeyCode::Left => self.move_cursor(-1)?,
             KeyCode::Right => self.move_cursor(1)?,
 
@@ -921,17 +1001,21 @@ impl App {
             KeyCode::Up => self.step_rows(1, false)?,
             KeyCode::PageDown | KeyCode::Char(' ') => self.page_rows(page, true)?,
             KeyCode::PageUp => self.page_rows(page, false)?,
-            // Home and End go to the ends of the line, as they do in a DOS
-            // viewer; the whole file is one Ctrl away.
-            KeyCode::Home if ctrl => self.go_to(0)?,
-            KeyCode::End if ctrl => self.go_end()?,
-            KeyCode::Home => self.go_row_edge(false)?,
-            KeyCode::End => self.go_row_edge(true)?,
+            // Home and End take the whole file; the ends of a line are on the
+            // modified arrows.
+            KeyCode::Home => self.go_to(0)?,
+            KeyCode::End => self.go_end()?,
 
-            KeyCode::Char('g') | KeyCode::F(5) => self.input = Input::Goto(String::new()),
+            // Every slot the bottom bar advertises answers to its own digit:
+            // the bar said 5, 7 and 8 long before anything was listening.
+            KeyCode::Char('g') | KeyCode::Char('5') | KeyCode::F(5) => {
+                self.input = Input::Goto(String::new())
+            }
             KeyCode::Char('6') | KeyCode::F(6) => self.input = Input::Record(String::new()),
-            KeyCode::Char('/') | KeyCode::F(7) => self.input = Input::Search(String::new()),
-            KeyCode::Char('n') | KeyCode::F(8) => self.find_next()?,
+            KeyCode::Char('/') | KeyCode::Char('7') | KeyCode::F(7) => {
+                self.input = Input::Search(String::new())
+            }
+            KeyCode::Char('n') | KeyCode::Char('8') | KeyCode::F(8) => self.find_next()?,
             KeyCode::Char('r') => {
                 self.reload(false)?;
             }
@@ -1161,12 +1245,12 @@ fn main() {
         None => {
             eprintln!("dosview — a DOS-style file viewer for the terminal\n");
             eprintln!("Usage: dosview <file>\n");
-            eprintln!("  1/2/3        mode: binary, hex, text");
-            eprintln!("  4 or e       next code page: ASCII, CP437, CP866, CP1251, KOI8-R, UTF-8");
+            eprintln!("  1/2          mode: binary, hex");
+            eprintln!("  3            text mode; again for the next of 19 code pages");
+            eprintln!("  [ ] \\        narrower / wider / window-wide data columns");
             eprintln!("  ←→↑↓         move the cursor");
-            eprintln!("  Home/End     start / end of the line");
-            eprintln!("  Alt+←→       start / end of the line");
-            eprintln!("  Ctrl+Home/End  start / end of the file");
+            eprintln!("  Home/End     start / end of the file");
+            eprintln!("  Cmd/Ctrl/Alt+←→  start / end of the line");
             eprintln!("  PgUp/PgDn    page up and down");
             eprintln!("  Shift+←→     slide the byte grid (for unaligned structures)");
             eprintln!("  g or F5      go to offset");
@@ -1188,6 +1272,10 @@ fn main() {
     }
 }
 
+/// Whether the kitty keyboard protocol was turned on, so that it is turned
+/// back off exactly once — including from the panic hook.
+static ENHANCED: AtomicBool = AtomicBool::new(false);
+
 fn run(path: PathBuf) -> io::Result<()> {
     let mut app = App::new(path)?;
 
@@ -1203,6 +1291,25 @@ fn run(path: PathBuf) -> io::Result<()> {
     let mut out = io::stdout();
     execute!(out, EnterAlternateScreen, Hide)?;
 
+    // Ask for the kitty keyboard protocol. Plain xterm key reporting has no way
+    // to say "Cmd" at all, and cannot tell Alt+Left from Escape followed by a
+    // letter; with this, modified arrows arrive as themselves.
+    //
+    // Asked for blind, on purpose: crossterm can query whether the terminal
+    // supports it, but that means writing a question and waiting up to two
+    // seconds for an answer that never comes from the terminals which do not.
+    // A viewer that opens instantly on a 50 GB file has no business stalling
+    // two seconds on a keyboard question. A terminal that does not know the
+    // sequence swallows it, which is exactly what we want.
+    if execute!(
+        out,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )
+    .is_ok()
+    {
+        ENHANCED.store(true, Ordering::Relaxed);
+    }
+
     let result = event_loop(&mut app, &mut out);
 
     restore()?;
@@ -1211,6 +1318,9 @@ fn run(path: PathBuf) -> io::Result<()> {
 
 fn restore() -> io::Result<()> {
     let mut out = io::stdout();
+    if ENHANCED.swap(false, Ordering::Relaxed) {
+        let _ = execute!(out, PopKeyboardEnhancementFlags);
+    }
     execute!(out, Show, LeaveAlternateScreen)?;
     terminal::disable_raw_mode()
 }
@@ -1343,17 +1453,52 @@ mod tests {
     }
 
     #[test]
-    fn home_and_end_work_on_the_line_the_whole_file_needs_ctrl() {
+    fn home_and_end_take_the_file_the_modified_arrows_take_the_line() {
         let (_d, mut a) = app(&(0..20u8).collect::<Vec<_>>());
         a.go_to(11).unwrap();
+        // Cmd, Ctrl or Alt with an arrow: the ends of the line.
         a.go_row_edge(false).unwrap();
         assert_eq!(a.cur, 8);
         a.go_row_edge(true).unwrap();
         assert_eq!(a.cur, 15);
+        // Home and End: the ends of the file.
         a.go_end().unwrap();
         assert_eq!(a.cur, 19);
         a.go_to(0).unwrap();
         assert_eq!((a.cur, a.top), (0, 0));
+    }
+
+    #[test]
+    fn the_line_width_keys_step_within_the_limits() {
+        let (_d, mut a) = app(&(0..200u8).collect::<Vec<_>>());
+        a.mode = Mode::Hex;
+        a.bpl = 16;
+        a.fit_bpl = 16;
+
+        a.resize_line(false);
+        assert_eq!(a.fixed_bpl, Some(12), "hex steps in fours");
+        a.bpl = 12;
+        a.resize_line(false);
+        a.bpl = 8;
+        a.resize_line(false);
+        a.bpl = 4;
+        // Four bytes is as narrow as a hex dump goes.
+        a.resize_line(false);
+        assert_eq!(a.fixed_bpl, Some(4));
+
+        // And it never grows past what the window can hold.
+        a.bpl = 16;
+        a.resize_line(true);
+        assert_eq!(a.fixed_bpl, Some(16));
+    }
+
+    #[test]
+    fn the_line_width_keys_leave_text_mode_alone() {
+        let (_d, mut a) = app(&(0..200u8).collect::<Vec<_>>());
+        a.mode = Mode::Text;
+        a.resize_line(false);
+        assert_eq!(a.fixed_bpl, None);
+        assert!(a.status.contains("byte modes"));
     }
 
     #[test]

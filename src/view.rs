@@ -35,36 +35,64 @@ pub struct Layout {
     pub bpl: usize,
     /// How many hex digits the offset column holds.
     pub offset_digits: usize,
+    /// The widest line this terminal can hold in this mode — the ceiling the
+    /// line-width keys stop at.
+    pub fit: usize,
+}
+
+/// Smallest and largest line a mode allows, before the terminal width has its
+/// say. Four bytes is the narrowest hex dump worth reading; past 64 the eye
+/// cannot follow a row across anyway.
+pub fn limits(mode: Mode) -> (usize, usize) {
+    match mode {
+        Mode::Hex => (4, 64),
+        Mode::Binary => (1, 16),
+        Mode::Text => (1, 512),
+    }
+}
+
+/// How much one press of the line-width keys moves it. Hex steps in fours so
+/// the dump keeps the four-byte grouping that makes it readable.
+pub fn step(mode: Mode) -> usize {
+    match mode {
+        Mode::Hex => 4,
+        Mode::Binary => 1,
+        Mode::Text => 8,
+    }
 }
 
 /// Fit a layout to the terminal width.
 ///
+/// `fixed` is a line width the user asked for; without one the line is as wide
+/// as the terminal can hold. Either way the mode's own limits and the terminal
+/// width get the last word.
+///
 /// The offset column grows to 12 digits on files larger than 4 GiB — eight
 /// digits stop being enough there and offsets start looking truncated.
-pub fn layout(mode: Mode, width: u16, file_len: u64) -> Layout {
+pub fn layout(mode: Mode, width: u16, file_len: u64, fixed: Option<usize>) -> Layout {
     let offset_digits = if file_len > u32::MAX as u64 { 12 } else { 8 };
-    let ow = offset_digits + 2;
-    let avail = (width as usize).saturating_sub(ow);
+    let avail = (width as usize).saturating_sub(offset_digits + 2);
+    let (min, max) = limits(mode);
 
-    let bpl = match mode {
+    let fit = match mode {
         // "XX " per byte + separator + one text cell
         Mode::Hex => {
             let raw = avail.saturating_sub(1) / 4;
             // round down to a multiple of 4 — that is what makes a dump
             // readable by eye
-            let n = (raw / 4) * 4;
-            n.clamp(4, 64)
+            ((raw / 4) * 4).clamp(min, max)
         }
         // "bbbbbbbb " per byte + separator + one text cell
-        Mode::Binary => {
-            let raw = avail.saturating_sub(1) / 10;
-            raw.clamp(1, 16)
-        }
+        Mode::Binary => (avail.saturating_sub(1) / 10).clamp(min, max),
         // one cell per byte
-        Mode::Text => avail.clamp(1, 512),
+        Mode::Text => avail.clamp(min, max),
     };
 
-    Layout { bpl, offset_digits }
+    Layout {
+        bpl: fixed.map_or(fit, |n| n.clamp(min, fit)),
+        offset_digits,
+        fit,
+    }
 }
 
 const HEX_DIGITS: &[u8; 16] = b"0123456789ABCDEF";
@@ -143,7 +171,7 @@ mod tests {
     #[test]
     fn hex_layout_fits_the_width() {
         for w in [40u16, 80, 100, 120, 200] {
-            let l = layout(Mode::Hex, w, 1024);
+            let l = layout(Mode::Hex, w, 1024, None);
             let used = l.offset_digits + 2 + l.bpl * 3 + 1 + l.bpl;
             assert!(used <= w as usize, "w={w} bpl={} used={used}", l.bpl);
         }
@@ -152,7 +180,7 @@ mod tests {
     #[test]
     fn binary_layout_fits_the_width() {
         for w in [40u16, 80, 120, 200] {
-            let l = layout(Mode::Binary, w, 1024);
+            let l = layout(Mode::Binary, w, 1024, None);
             let used = l.offset_digits + 2 + l.bpl * 9 + 1 + l.bpl;
             assert!(used <= w as usize, "w={w} bpl={} used={used}", l.bpl);
         }
@@ -160,14 +188,39 @@ mod tests {
 
     #[test]
     fn huge_files_get_wider_offset_column() {
-        assert_eq!(layout(Mode::Hex, 120, 1024).offset_digits, 8);
-        assert_eq!(layout(Mode::Hex, 120, 8 * 1024 * 1024 * 1024).offset_digits, 12);
+        assert_eq!(layout(Mode::Hex, 120, 1024, None).offset_digits, 8);
+        assert_eq!(layout(Mode::Hex, 120, 8 * 1024 * 1024 * 1024, None).offset_digits, 12);
+    }
+
+    #[test]
+    fn a_chosen_line_width_is_honoured_within_the_limits() {
+        let wide = layout(Mode::Hex, 200, 1024, None);
+        assert_eq!(wide.bpl, wide.fit);
+
+        // Narrower than the terminal: that is the whole point of the keys.
+        assert_eq!(layout(Mode::Hex, 200, 1024, Some(8)).bpl, 8);
+        // Wider than the terminal can hold, or narrower than the mode allows:
+        // clamped, never left to spill or collapse.
+        assert_eq!(layout(Mode::Hex, 200, 1024, Some(999)).bpl, wide.fit);
+        assert_eq!(layout(Mode::Hex, 200, 1024, Some(1)).bpl, 4);
+        assert_eq!(layout(Mode::Binary, 200, 1024, Some(999)).bpl, layout(Mode::Binary, 200, 1024, None).fit);
+    }
+
+    #[test]
+    fn a_chosen_width_still_fits_the_window() {
+        for w in [40u16, 80, 120, 200] {
+            for want in [1usize, 4, 16, 64, 999] {
+                let l = layout(Mode::Hex, w, 1024, Some(want));
+                let used = l.offset_digits + 2 + l.bpl * 3 + 1 + l.bpl;
+                assert!(used <= w as usize, "w={w} want={want} bpl={}", l.bpl);
+            }
+        }
     }
 
     /// Build a whole line the same way drawing does.
     fn line(mode: Mode, enc: Encoding, bytes: &[u8], bpl: usize) -> String {
         let mut glyphs = Vec::new();
-        encoding::decode(enc, bytes, &mut glyphs);
+        encoding::decode(enc, 0, bytes, &mut glyphs);
         let mut s = String::new();
         for i in 0..bpl {
             match bytes.get(i) {
