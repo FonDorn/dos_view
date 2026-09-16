@@ -265,8 +265,10 @@ Matches are highlighted in both the byte and text columns.
 | Key | Action |
 |---|---|
 | `7` / `F7` | Start search |
-| `8` / `F8` | Next match |
-| `p` | Previous match |
+| `n` / `F8` | Next match |
+| `p` / `N` | Previous match |
+| `9` (while searching) | Next match |
+| `8` (while searching) | Previous match |
 | `Esc` | Clear search |
 | `h` | Toggle highlighting |
 
@@ -347,10 +349,11 @@ Press `9` or `F9` to switch between these modes.
 | `5` / `F5` | Go to offset |
 | `6` / `F6` | Format records |
 | `7` / `F7` | Search |
-| `8` / `F8` | Next match |
-| `p` | Previous match |
+| `n` / `F8` | Next match |
+| `p` / `N` | Previous match |
+| `9` / `8` (while searching) | Next / previous match |
 | `Esc` | Clear search |
-| `9` / `F9` | Wrap long records |
+| `9` / `F9` (with records formatted) | Wrap long records |
 | `h` | Toggle highlighting |
 | `r` | Reread file |
 | `q` / `F10` | Quit |

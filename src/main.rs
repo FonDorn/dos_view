@@ -925,8 +925,8 @@ impl App {
     fn bar_slots(&self) -> Vec<(&'static str, &'static str)> {
         if self.needle.is_some() {
             return vec![
-                ("8", "Next"),
-                ("p", "Prev"),
+                ("9", "Next"),
+                ("8", "Prev"),
                 ("7", "Find"),
                 ("Esc", "Clear"),
                 ("10", "Quit"),
@@ -1154,7 +1154,14 @@ impl App {
             KeyCode::F(3) | KeyCode::Char('#') => self.open_picker(),
             KeyCode::Char('e') if !shift && !ctrl => self.set_encoding(self.enc.next()),
             KeyCode::Char('e') | KeyCode::Char('E') => self.set_encoding(self.enc.prev()),
-            KeyCode::Char('9') | KeyCode::F(9) => self.toggle_wrap(),
+            // 9 answers to whichever slot the bar is currently showing for it
+            // — Next while a search is live, Wrap/Cut once a record pattern
+            // is set — and does nothing while neither is true, same as the
+            // bar shows nothing for it then.
+            KeyCode::Char('9') | KeyCode::F(9) if self.needle.is_some() => {
+                self.search_step(true)?
+            }
+            KeyCode::Char('9') | KeyCode::F(9) if self.record.is_some() => self.toggle_wrap(),
             KeyCode::Char('[') => self.resize_line(false),
             KeyCode::Char(']') => self.resize_line(true),
             KeyCode::Char('\\') => {
@@ -1189,7 +1196,8 @@ impl App {
             KeyCode::Char('/') | KeyCode::Char('7') | KeyCode::F(7) => {
                 self.input = Input::Search(String::new())
             }
-            KeyCode::Char('n') | KeyCode::Char('8') | KeyCode::F(8) => self.search_step(true)?,
+            KeyCode::Char('n') | KeyCode::F(8) => self.search_step(true)?,
+            KeyCode::Char('8') if self.needle.is_some() => self.search_step(false)?,
             KeyCode::Char('p') | KeyCode::Char('N') => self.search_step(false)?,
             KeyCode::Char('r') => {
                 self.reload(false)?;
@@ -1506,7 +1514,7 @@ fn main() {
             eprintln!("  6 or F6      format: break lines on a pattern, e.g. x:0A");
             eprintln!("  9 or F9      wrap long formatted lines instead of cutting them");
             eprintln!("  7 or F7      search; x: for hex bytes, ?? for any byte");
-            eprintln!("  8 or F8      next match; p for the previous one");
+            eprintln!("  n or F8      next match; p for the previous one (9/8 while searching)");
             eprintln!("  Esc          clear the search");
             eprintln!("  h            toggle match highlighting");
             eprintln!("  r            reread the file now (it is also watched while idle)");
