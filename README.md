@@ -30,11 +30,21 @@ The application is built from the same Rust codebase for **macOS, Linux, and Win
 
 ## Installation
 
+### With Cargo
+
+If you have Rust 1.87 or newer:
+
+```bash
+cargo install dosview
+```
+
+### Prebuilt binaries
+
 Download the latest release for your operating system from:
 
 **[GitHub Releases](https://github.com/FonDorn/dos_view/releases)**
 
-### macOS
+#### macOS
 
 Choose the version that matches your Mac:
 
@@ -64,7 +74,7 @@ macOS may show a security warning because the downloaded binary is not signed or
 xattr -d com.apple.quarantine ./dosview
 ```
 
-### Linux
+#### Linux
 
 Choose the version that matches your system:
 
@@ -86,7 +96,7 @@ For example:
 ./dosview-0.1.0-linux-x86_64 image.bin
 ```
 
-### Windows
+#### Windows
 
 Download:
 

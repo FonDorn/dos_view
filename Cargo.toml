@@ -1,11 +1,18 @@
 [package]
 name = "dosview"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 # usize::is_multiple_of
 rust-version = "1.87"
 description = "DOS-style terminal file viewer: binary / hex / text in CP437, CP866, CP1251, KOI8-R, UTF-8"
 license = "MIT"
+authors = ["Mike Nedosekin"]
+repository = "https://github.com/FonDorn/dos_view"
+homepage = "https://github.com/FonDorn/dos_view"
+readme = "README.md"
+keywords = ["hex", "viewer", "binary", "tui", "codepage"]
+categories = ["command-line-utilities", "encoding"]
+exclude = ["docs/", ".github/", ".claude/"]
 
 [dependencies]
 crossterm = "0.28"

@@ -12,8 +12,37 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  check:
+    name: Check version and tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Tag matches Cargo.toml version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "dosview") | .version')"
+
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${cargo_version}"
+            exit 1
+          fi
+
+      - name: Test
+        run: cargo test --locked
+
   build:
     name: Build ${{ matrix.name }}
+    needs: check
 
     strategy:
       fail-fast: false
@@ -22,27 +51,27 @@ jobs:
           - name: macOS ARM64
             os: macos-14
             target: aarch64-apple-darwin
-            filename: dosview-macos-arm64
+            platform: macos-arm64
 
           - name: macOS Intel
             os: macos-15-intel
             target: x86_64-apple-darwin
-            filename: dosview-macos-x86_64
+            platform: macos-x86_64
 
           - name: Linux ARM64
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            filename: dosview-linux-arm64
+            platform: linux-arm64
 
           - name: Linux x86_64
             os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            filename: dosview-linux-x86_64
+            platform: linux-x86_64
 
           - name: Windows x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
-            filename: dosview-windows-x86_64.exe
+            platform: windows-x86_64
 
     runs-on: ${{ matrix.os }}
 
@@ -64,24 +93,26 @@ jobs:
         run: |
           set -euo pipefail
 
-          cp "target/${{ matrix.target }}/release/dosview" \
-             "dist-${{ matrix.filename }}"
+          name="dosview-${GITHUB_REF_NAME#v}-${{ matrix.platform }}"
+          echo "ASSET=$name" >> "$GITHUB_ENV"
 
-          chmod +x "dist-${{ matrix.filename }}"
+          cp "target/${{ matrix.target }}/release/dosview" "$name"
+          chmod +x "$name"
 
       - name: Prepare Windows binary
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Copy-Item `
-            "target/${{ matrix.target }}/release/dosview.exe" `
-            "dist-${{ matrix.filename }}"
+          $name = "dosview-$($env:GITHUB_REF_NAME.TrimStart('v'))-${{ matrix.platform }}.exe"
+          "ASSET=$name" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          Copy-Item "target/${{ matrix.target }}/release/dosview.exe" $name
 
       - name: Upload binary
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.filename }}
-          path: dist-${{ matrix.filename }}
+          name: ${{ env.ASSET }}
+          path: ${{ env.ASSET }}
           if-no-files-found: error
           retention-days: 1
 
